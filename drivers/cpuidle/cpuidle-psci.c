@@ -60,8 +60,10 @@ static __cpuidle int __psci_enter_domain_idle_state(struct cpuidle_device *dev,
 	int ret;
 
 	ret = cpu_pm_enter();
-	if (ret)
+	if (ret) {
+		cpuidle_clear_idle_cpu(dev->cpu);
 		return -1;
+	}
 
 	/* Do runtime PM to manage a hierarchical CPU toplogy. */
 	trace_android_vh_cpuidle_psci_enter(dev, s2idle);
@@ -76,6 +78,7 @@ static __cpuidle int __psci_enter_domain_idle_state(struct cpuidle_device *dev,
 		state = states[idx];
 
 	ret = psci_cpu_suspend_enter(state) ? -1 : idx;
+	cpuidle_clear_idle_cpu(dev->cpu);
 
 	if (s2idle)
 		dev_pm_genpd_resume(pd_dev);
