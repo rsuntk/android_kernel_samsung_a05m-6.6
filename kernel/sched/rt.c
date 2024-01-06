@@ -2810,6 +2810,7 @@ static int task_is_throttled_rt(struct task_struct *p, int cpu)
 }
 #endif
 
+#include "cass_rt.h"
 DEFINE_SCHED_CLASS(rt) = {
 
 	.enqueue_task		= enqueue_task_rt,
