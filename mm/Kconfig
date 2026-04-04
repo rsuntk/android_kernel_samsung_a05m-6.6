@@ -1329,4 +1329,11 @@ config MEMFD_ASHMEM_SHIM
 
 source "mm/damon/Kconfig"
 
+config IO_RECORD
+	bool "IO_RECORT feature"
+	depends on MMU
+	default y
+	help
+	  Enable this for IO_RECORD
+
 endmenu

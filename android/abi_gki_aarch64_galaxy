@@ -97,10 +97,10 @@
   __traceiter_android_vh_dpm_wait_finish
   __traceiter_android_vh_dpm_wait_start
   __traceiter_android_vh_exit_mm
-  __traceiter_android_vh_filemap_fault_start
-  __traceiter_android_vh_filemap_fault_end
   __traceiter_android_vh_filemap_read
   __traceiter_android_vh_filemap_map_pages
+  __traceiter_android_vh_filemap_fault_start
+  __traceiter_android_vh_filemap_fault_end
   __traceiter_android_vh_flush_work_wait_finish
   __traceiter_android_vh_flush_work_wait_start
   __traceiter_android_vh_flush_wq_wait_finish
@@ -186,10 +186,10 @@
   __tracepoint_android_vh_dpm_wait_finish
   __tracepoint_android_vh_dpm_wait_start
   __tracepoint_android_vh_exit_mm
-  __tracepoint_android_vh_filemap_fault_start
-  __tracepoint_android_vh_filemap_fault_end
   __tracepoint_android_vh_filemap_read
   __tracepoint_android_vh_filemap_map_pages
+  __tracepoint_android_vh_filemap_fault_start
+  __tracepoint_android_vh_filemap_fault_end
   __tracepoint_android_vh_flush_work_wait_finish
   __tracepoint_android_vh_flush_work_wait_start
   __tracepoint_android_vh_flush_wq_wait_finish

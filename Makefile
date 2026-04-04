@@ -1063,6 +1063,12 @@ KBUILD_AFLAGS   += $(KAFLAGS)
 KBUILD_CFLAGS   += $(KCFLAGS)
 KBUILD_RUSTFLAGS += $(KRUSTFLAGS)
 
+#+Chk S96901AA5-1364,zhaozhuo.wt,ADD, 20240914,add mp version control[1/2]
+ifeq ($(WT_FINAL_RELEASE),yes)
+KBUILD_CFLAGS += -DWT_FINAL_RELEASE
+endif
+#-Chk S96901AA5-1364,zhaozhuo.wt,ADD, 20240914,add mp version control[1/2]
+
 KBUILD_LDFLAGS_MODULE += --build-id=sha1
 LDFLAGS_vmlinux += --build-id=sha1
 
