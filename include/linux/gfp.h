@@ -136,9 +136,7 @@ static inline enum zone_type __gfp_zone(gfp_t flags)
 	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
 
 #if !defined(CONFIG_ARM)
-
 	if (z == ZONE_MOVABLE)
-
 		return LAST_VIRT_ZONE;
 #endif
 
@@ -146,7 +144,6 @@ static inline enum zone_type __gfp_zone(gfp_t flags)
 	if ((flags & __GFP_COMP) && (flags & __GFP_HIGHMEM) &&
 	    !static_branch_unlikely(&movablecore_enabled) && !movable_node_is_enabled())
 		return LAST_VIRT_ZONE;
-
 
 	return z;
 }

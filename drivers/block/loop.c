@@ -34,6 +34,7 @@
 #include <linux/statfs.h>
 #include <linux/uaccess.h>
 #include <linux/loop.h>
+#include <trace/hooks/blk.h>
 
 #define LOOP_IDLE_WORKER_TIMEOUT (60 * HZ)
 #define LOOP_DEFAULT_HW_Q_DEPTH 128
@@ -776,8 +777,12 @@ static void loop_queue_work(struct loop_device *lo, struct loop_cmd *cmd)
 	struct loop_worker *cur_worker, *worker = NULL;
 	struct work_struct *work;
 	struct list_head *cmd_list;
+	bool skip = false;
 
 	spin_lock_irq(&lo->lo_work_lock);
+	trace_android_vh_loop_skip_queue_work(blk_mq_rq_from_pdu(cmd), &skip);
+        if (skip)
+                goto skip_queue_work;
 
 	if (queue_on_root_worker(cmd->blkcg_css))
 		goto queue_work;
@@ -837,6 +842,7 @@ queue_work:
 	}
 	list_add_tail(&cmd->list_entry, cmd_list);
 	queue_work(lo->workqueue, work);
+skip_queue_work:
 	spin_unlock_irq(&lo->lo_work_lock);
 }
 
@@ -1418,19 +1424,36 @@ static int loop_set_dio(struct loop_device *lo, unsigned long arg)
 	return error;
 }
 
-static int loop_set_block_size(struct loop_device *lo, unsigned long arg)
+static int loop_set_block_size(struct loop_device *lo, blk_mode_t mode,
+			       struct block_device *bdev, unsigned long arg)
 {
 	int err = 0;
 
-	if (lo->lo_state != Lo_bound)
-		return -ENXIO;
+	/*
+	 * If we don't hold exclusive handle for the device, upgrade to it
+	 * here to avoid changing device under exclusive owner.
+	 */
+	if (!(mode & BLK_OPEN_EXCL)) {
+		err = bd_prepare_to_claim(bdev, loop_set_block_size, NULL);
+		if (err)
+			return err;
+	}
+
+	err = mutex_lock_killable(&lo->lo_mutex);
+	if (err)
+		goto abort_claim;
+
+	if (lo->lo_state != Lo_bound) {
+		err = -ENXIO;
+		goto unlock;
+	}
 
 	err = blk_validate_block_size(arg);
 	if (err)
-		return err;
+		goto unlock;
 
 	if (lo->lo_queue->limits.logical_block_size == arg)
-		return 0;
+		goto unlock;
 
 	sync_blockdev(lo->lo_device);
 	invalidate_bdev(lo->lo_device);
@@ -1442,6 +1465,11 @@ static int loop_set_block_size(struct loop_device *lo, unsigned long arg)
 	loop_update_dio(lo);
 	blk_mq_unfreeze_queue(lo->lo_queue);
 
+unlock:
+	mutex_unlock(&lo->lo_mutex);
+abort_claim:
+	if (!(mode & BLK_OPEN_EXCL))
+		bd_abort_claiming(bdev, loop_set_block_size);
 	return err;
 }
 
@@ -1459,9 +1487,6 @@ static int lo_simple_ioctl(struct loop_device *lo, unsigned int cmd,
 		break;
 	case LOOP_SET_DIRECT_IO:
 		err = loop_set_dio(lo, arg);
-		break;
-	case LOOP_SET_BLOCK_SIZE:
-		err = loop_set_block_size(lo, arg);
 		break;
 	default:
 		err = -EINVAL;
@@ -1517,9 +1542,12 @@ static int lo_ioctl(struct block_device *bdev, blk_mode_t mode,
 		break;
 	case LOOP_GET_STATUS64:
 		return loop_get_status64(lo, argp);
+	case LOOP_SET_BLOCK_SIZE:
+		if (!(mode & BLK_OPEN_WRITE) && !capable(CAP_SYS_ADMIN))
+			return -EPERM;
+		return loop_set_block_size(lo, mode, bdev, arg);
 	case LOOP_SET_CAPACITY:
 	case LOOP_SET_DIRECT_IO:
-	case LOOP_SET_BLOCK_SIZE:
 		if (!(mode & BLK_OPEN_WRITE) && !capable(CAP_SYS_ADMIN))
 			return -EPERM;
 		fallthrough;
@@ -1909,6 +1937,13 @@ static void loop_process_work(struct loop_worker *worker,
 	spin_unlock_irq(&lo->lo_work_lock);
 	current->flags = orig_flags;
 }
+
+void loop_process_cmd_list(struct list_head *cmd_list, struct gendisk *disk)
+{
+	struct loop_device *lo = disk->private_data;
+	loop_process_work(NULL, cmd_list, lo);
+}
+EXPORT_SYMBOL_GPL(loop_process_cmd_list);
 
 static void loop_workfn(struct work_struct *work)
 {
