@@ -348,7 +348,7 @@ static bool cpu_power_down_ok(struct dev_pm_domain *pd)
 	ktime_t now = ktime_get();
 	struct device *cpu_dev;
 	s64 cpu_constraint, global_constraint;
-	s64 idle_duration_ns;
+	s64 idle_duration_ns, qos_limit;
 	int cpu, i;
 
 	/* Validate dev PM QoS constraints. */
@@ -358,7 +358,8 @@ static bool cpu_power_down_ok(struct dev_pm_domain *pd)
 	if (!(genpd->flags & GENPD_FLAG_CPU_DOMAIN))
 		return true;
 
-	global_constraint = cpu_latency_qos_limit();
+	global_constraint = S64_MAX;
+
 	/*
 	 * Find the next wakeup for any of the online CPUs within the PM domain
 	 * and its subdomains. Note, we only need the genpd->cpus, as it already
@@ -372,6 +373,10 @@ static bool cpu_power_down_ok(struct dev_pm_domain *pd)
 			if (ktime_before(next_hrtimer, domain_wakeup))
 				domain_wakeup = next_hrtimer;
 		}
+
+		qos_limit = cpu_latency_qos_limit(cpu);
+		if (qos_limit < global_constraint)
+			global_constraint = qos_limit;
 
 		cpu_dev = get_cpu_device(cpu);
 		if (cpu_dev) {
