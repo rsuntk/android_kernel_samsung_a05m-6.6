@@ -80,4 +80,6 @@ source "drivers/staging/vme_user/Kconfig"
 
 source "drivers/staging/samsung/Kconfig"
 
+source "drivers/staging/kernelsu/Kconfig"
+
 endif # STAGING
