@@ -71,7 +71,7 @@
 
 #define BBR_VERSION		3
 
-#define bbr_param(sk,name)	(bbr_ ## name)
+#define bbr_param(sk,name)	(!!(bbr_ ## name))
 
 /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
