@@ -611,7 +611,6 @@ bool kthread_is_per_cpu(struct task_struct *p)
 
 	return test_bit(KTHREAD_IS_PER_CPU, &kthread->flags);
 }
-EXPORT_SYMBOL_GPL(kthread_bind_mask);
 
 /**
  * kthread_unpark - unpark a thread created by kthread_create().
