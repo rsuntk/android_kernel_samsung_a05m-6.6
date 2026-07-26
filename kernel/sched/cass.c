@@ -185,7 +185,6 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 * sync wakes, treat the current CPU as idle if @current is the
 		 * only running task.
 		 */
-		curr->cpu = cpu;
 		if ((sync && cpu == this_cpu && rq->nr_running == 1) ||
 		    available_idle_cpu(cpu) || sched_idle_cpu(cpu)) {
 			/*
@@ -194,8 +193,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 			 * minimum capacity. Otherwise, prefer idle
 			 * candidates.
 			 */
-			if (!has_idle &&
-			    uc_min <= arch_scale_min_freq_capacity(cpu)) {
+			if (!has_idle && uc_min <= arch_scale_min_freq_capacity(cpu)) {
 				/* Discard any previous non-idle candidate */
 				best = curr;
 				has_idle = true;
@@ -218,6 +216,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		}
 
 		/* Get this CPU's capacity and utilization */
+		curr->cpu = cpu;
 		cass_cpu_util(curr, this_cpu, sync);
 
 		/*
