@@ -36,7 +36,7 @@ static __always_inline bool task_is_critical(void)
 	if (unlikely(!current->signal))
 		return false;
 
-	return READ_ONCE(current->signal->oom_score_adj) <= CRITICAL_OOM_SCORE_ADJ;s
+	return READ_ONCE(current->signal->oom_score_adj) <= CRITICAL_OOM_SCORE_ADJ;
 }
 
 static __always_inline void boost_freelist_priority_for_critical(void)
