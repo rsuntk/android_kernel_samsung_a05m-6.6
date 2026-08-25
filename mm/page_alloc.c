@@ -1290,6 +1290,7 @@ static __always_inline bool free_pages_prepare(struct page *page,
 	page_cpupid_reset_last(page);
 	page->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
 	trace_android_vh_mm_free_page(page);
+	page->private = 0;
 	reset_page_owner(page, order);
 	free_page_pinner(page, order);
 	page_table_check_free(page, order);
@@ -2694,6 +2695,13 @@ void free_unref_page(struct page *page, unsigned int order)
 	trace_android_vh_free_unref_page_bypass(page, order, migratetype, &skip_free_unref_page);
 	if (skip_free_unref_page)
 		return;
+#ifdef CONFIG_CMA
+	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && unlikely(migratetype == MIGRATE_CMA &&
+	    order > PAGE_ALLOC_COSTLY_ORDER)) {
+		free_one_page(page_zone(page), page, pfn, order, FPI_NONE);
+		return;
+	}
+#endif
 	if (unlikely(migratetype > MIGRATE_RECLAIMABLE)) {
 		if (unlikely(is_migrate_isolate(migratetype))) {
 			free_one_page(page_zone(page), page, pfn, order, FPI_NONE);
@@ -2769,9 +2777,16 @@ void free_unref_folios(struct folio_batch *folios)
 		folio->private = NULL;
 		migratetype = get_pfnblock_migratetype(&folio->page, pfn);
 
+#if defined(CONFIG_CMA) && defined(CONFIG_TRANSPARENT_HUGEPAGE)
+		bool is_cma_thp = (migratetype == MIGRATE_CMA && order > PAGE_ALLOC_COSTLY_ORDER);
+#else
+		bool is_cma_thp = false;
+#endif
+
 		/* Different zone requires a different pcp lock */
 		if (zone != locked_zone ||
-		    is_migrate_isolate(migratetype)) {
+		    is_migrate_isolate(migratetype) ||
+		    is_cma_thp) {
 			if (pcp) {
 				pcp_spin_unlock(pcp);
 				pcp_trylock_finish(UP_flags);
@@ -2783,7 +2798,7 @@ void free_unref_folios(struct folio_batch *folios)
 			 * Free isolated pages directly to the
 			 * allocator, see comment in free_unref_page.
 			 */
-			if (is_migrate_isolate(migratetype)) {
+			if (is_migrate_isolate(migratetype) || is_cma_thp) {
 				free_one_page(zone, &folio->page, pfn,
 					      order, FPI_NONE);
 				continue;
@@ -3144,8 +3159,13 @@ struct page *rmqueue(struct zone *preferred_zone,
 	trace_android_vh_mm_customize_rmqueue(zone, order, &alloc_flags, &migratetype);
 
 	if (likely(pcp_allowed_order(order))) {
+		unsigned int pcp_alloc_flags = alloc_flags;
+
+		if (IS_ENABLED(CONFIG_CMA) && IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
+		    unlikely(order > PAGE_ALLOC_COSTLY_ORDER))
+			pcp_alloc_flags &= ~ALLOC_CMA;
 		page = rmqueue_pcplist(preferred_zone, zone, order,
-				       migratetype, alloc_flags);
+				       migratetype, pcp_alloc_flags);
 		if (likely(page))
 			goto out;
 	}
@@ -6742,11 +6762,16 @@ int __alloc_contig_migrate_range(struct compact_control *cc,
 	unsigned long total_mapped = 0;
 	unsigned long total_migrated = 0;
 	unsigned long total_reclaimed = 0;
+	bool skip_lru_cache = false;
 
 	if (cc->gfp_mask & __GFP_NORETRY)
 		max_tries = 1;
 
-	lru_cache_disable();
+	trace_android_vh_alloc_contig_range_skip_lru(
+		start, end, migratetype, cc->gfp_mask, &skip_lru_cache);
+
+	if (!skip_lru_cache)
+		lru_cache_disable();
 
 	while (pfn < end || !list_empty(&cc->migratepages)) {
 		if (fatal_signal_pending(current)) {
@@ -6790,7 +6815,8 @@ int __alloc_contig_migrate_range(struct compact_control *cc,
 			break;
 	}
 
-	lru_cache_enable();
+	if (!skip_lru_cache)
+		lru_cache_enable();
 	if (ret < 0) {
 		if (!(cc->gfp_mask & __GFP_NOWARN) && ret == -EBUSY) {
 			struct page *page;
