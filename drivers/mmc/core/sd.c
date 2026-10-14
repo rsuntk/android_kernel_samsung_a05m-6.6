@@ -20,6 +20,7 @@
 #include <linux/mmc/card.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
+#include <trace/hooks/mmc.h>
 
 #include "core.h"
 #include "card.h"
@@ -1427,7 +1428,6 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 	bool v18_fixup_failed = false;
 
 	WARN_ON(!host->claimed);
-	host->unused = 0;
 retry:
 	err = mmc_sd_get_cid(host, ocr, cid, &rocr);
 	if (err)
@@ -1773,8 +1773,6 @@ static int _mmc_sd_resume(struct mmc_host *host)
 
 	mmc_power_up(host, host->card->ocr);
 	err = mmc_sd_init_card(host, host->card->ocr, host->card);
-	if (err)
-			host->unused = 1;
 	mmc_card_clr_suspended(host->card);
 
 out:
@@ -1826,12 +1824,8 @@ static int mmc_sd_runtime_resume(struct mmc_host *host)
 
 static int mmc_sd_hw_reset(struct mmc_host *host)
 {
-	int err;
 	mmc_power_cycle(host, host->card->ocr);
-	err = mmc_sd_init_card(host, host->card->ocr, host->card);
-	if (err)
-		host->unused = 1;
-	return err;
+	return mmc_sd_init_card(host, host->card->ocr, host->card);
 }
 
 static const struct mmc_bus_ops mmc_sd_ops = {
@@ -1915,13 +1909,9 @@ remove_card:
 err:
 	mmc_detach_bus(host);
 
-	pr_err("%s: error %d whilst initialising SD card\n",
-		mmc_hostname(host), err);
 	ST_LOG("%s: error %d whilst initialising SD card\n",
 		mmc_hostname(host), err);
-
-	if (err)
-		host->unused = 1;
+	trace_android_vh_mmc_attach_sd(host, err);
 
 	return err;
 }
