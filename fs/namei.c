@@ -4261,6 +4261,10 @@ retry:
 	if (error)
 		goto exit4;
 	error = vfs_rmdir(mnt_idmap(path.mnt), path.dentry->d_inode, dentry);
+#ifdef CONFIG_PROC_DLOG
+	if (!error)
+		dlog_hook_rmdir(dentry, &path);
+#endif
 exit4:
 	dput(dentry);
 exit3:
@@ -4398,6 +4402,10 @@ retry_deleg:
 			goto exit3;
 		error = vfs_unlink(mnt_idmap(path.mnt), path.dentry->d_inode,
 				   dentry, &delegated_inode);
+#ifdef CONFIG_PROC_DLOG
+		if (!error)
+			dlog_hook(dentry, inode, &path);
+#endif
 exit3:
 		dput(dentry);
 	}

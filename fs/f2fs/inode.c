@@ -471,6 +471,9 @@ static int do_read_inode(struct inode *inode)
 	}
 
 	if (!sanity_check_inode(inode, node_page)) {
+		print_block_data(sbi, inode->i_ino, page_address(node_page),
+				0, F2FS_BLKSIZE);
+		f2fs_bug_on(sbi, 1);
 		f2fs_put_page(node_page, 1);
 		set_sbi_flag(sbi, SBI_NEED_FSCK);
 		f2fs_handle_error(sbi, ERROR_CORRUPTED_INODE);
@@ -532,7 +535,11 @@ static int do_read_inode(struct inode *inode)
 
 	init_idisk_time(inode);
 
-	if (!sanity_check_extent_cache(inode, node_page)) {
+	if (!sanity_check_extent_cache(inode, node_page)
+		|| unlikely((inode->i_mode & S_IFMT) == 0)) {
+		print_block_data(sbi, inode->i_ino, page_address(node_page),
+				0, F2FS_BLKSIZE);
+		f2fs_bug_on(sbi, 1);
 		f2fs_put_page(node_page, 1);
 		f2fs_handle_error(sbi, ERROR_CORRUPTED_INODE);
 		return -EFSCORRUPTED;

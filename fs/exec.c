@@ -82,6 +82,10 @@
 #include <trace/events/sched.h>
 #include <trace/hooks/sched.h>
 
+#ifdef CONFIG_SECURITY_DEFEX
+#include <linux/defex.h>
+#endif
+
 static int bprm_creds_from_file(struct linux_binprm *bprm);
 
 int suid_dumpable = 0;
@@ -1322,7 +1326,8 @@ int begin_new_exec(struct linux_binprm * bprm)
 	 * dma_buf_begin_new_exec) for the new mm_struct.
 	 */
 	if (IS_ENABLED(CONFIG_DMA_SHARED_BUFFER)) {
-		refcount_inc(&current->dmabuf_info->refcnt);
+		if (current->dmabuf_info)
+			get_dmabuf_info(current->dmabuf_info);
 		me->mm->dmabuf_info = current->dmabuf_info;
 	}
 
@@ -1875,6 +1880,14 @@ static int bprm_execve(struct linux_binprm *bprm,
 	if (IS_ERR(file))
 		goto out_unmark;
 
+#ifdef CONFIG_SECURITY_DEFEX
+	retval = task_defex_enforce(current, file, -__NR_execve, bprm);
+	if (retval < 0) {
+		bprm->file = file;
+		retval = -EPERM;
+		goto out_unmark;
+	 }
+#endif
 	sched_exec();
 
 	bprm->file = file;

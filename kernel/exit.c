@@ -76,6 +76,10 @@
 #include <trace/hooks/mm.h>
 #include <trace/hooks/dtask.h>
 
+#ifdef CONFIG_SECURITY_DEFEX
+#include <linux/defex.h>
+#endif
+
 /*
  * The default value should be high enough to not crash a system that randomly
  * crashes its kernel from time to time, but low enough to at least not permit
@@ -820,6 +824,9 @@ void __noreturn do_exit(long code)
 
 	synchronize_group_exit(tsk, code);
 
+#ifdef CONFIG_SECURITY_DEFEX
+	task_defex_zero_creds(current);
+#endif
 	WARN_ON(tsk->plug);
 
 	profile_task_exit(tsk);
@@ -835,6 +842,7 @@ void __noreturn do_exit(long code)
 
 	trace_android_vh_exit_check(current);
 
+	trace_android_vh_lock_task_exit(tsk);
 	/* sync mm's RSS info before statistics gathering */
 	if (tsk->mm)
 		sync_mm_rss(tsk->mm);

@@ -1429,6 +1429,7 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 	BUG_ON(!folio_test_locked(folio));
 	BUG_ON(mapping != folio_mapping(folio));
 
+	trace_android_vh_remove_mapping(mapping, folio, reclaimed);
 	if (!folio_test_swapcache(folio))
 		spin_lock(&mapping->host->i_lock);
 	xa_lock_irq(&mapping->i_pages);
@@ -1521,6 +1522,7 @@ cannot_free:
 	xa_unlock_irq(&mapping->i_pages);
 	if (!folio_test_swapcache(folio))
 		spin_unlock(&mapping->host->i_lock);
+	trace_android_vh_remove_mapping_failed(mapping, folio, reclaimed);
 	return 0;
 }
 
@@ -8028,6 +8030,24 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 	finish_wait(&pgdat->kswapd_wait, &wait);
 }
 
+static struct cpumask kswapd_cpumask;
+
+static int __init early_kswapd_cpumask_param(char *buf)
+{
+	unsigned int res;
+	int ret = kstrtouint(buf, 16, &res);
+	int i;
+
+	if (!ret) {
+		cpumask_clear(&kswapd_cpumask);
+		for (i = 0; i < nr_cpu_ids; i++)
+			if (res & (1 << i))
+				cpumask_set_cpu(i, &kswapd_cpumask);
+	}
+	return ret;
+}
+early_param("kswapd_cpumask", early_kswapd_cpumask_param);
+
 /*
  * The background pageout daemon, started as a kernel thread
  * from the init process.
@@ -8047,7 +8067,8 @@ static int kswapd(void *p)
 	unsigned int highest_zoneidx = MAX_NR_ZONES - 1;
 	pg_data_t *pgdat = (pg_data_t *)p;
 	struct task_struct *tsk = current;
-	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
+	const struct cpumask *cpumask = !cpumask_empty(&kswapd_cpumask) ?
+		&kswapd_cpumask : cpumask_of_node(pgdat->node_id);
 
 	if (!cpumask_empty(cpumask))
 		set_cpus_allowed_ptr(tsk, cpumask);

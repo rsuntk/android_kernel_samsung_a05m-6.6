@@ -51,6 +51,7 @@
 #include <linux/ksm.h>
 #include <linux/memfd.h>
 #include <linux/dma-buf.h>
+#include <linux/wrapfd.h>
 
 #include <linux/uaccess.h>
 #include <asm/cacheflush.h>
@@ -3151,6 +3152,14 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 			goto out;
 	}
 
+	/*
+	 * Remapping pages of the wrapfd is not supported since vma->vm_file
+	 * points to the file object representing the wrapped content and not
+	 * the wrapfd.
+	 */
+	if (unlikely(is_wrapfd_vma(vma)))
+		goto out;
+
 	ret = do_mmap(vma->vm_file, start, size,
 			prot, flags, 0, pgoff, &populate, NULL);
 out:
@@ -3509,6 +3518,8 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		new_vma = vm_area_dup(vma);
 		if (!new_vma)
 			goto out;
+		/* Do not preserve padding flags on the new VMA */
+		vm_flags_clear(new_vma, VM_PAD_MASK);
 		new_vma->vm_start = addr;
 		new_vma->vm_end = addr + len;
 		new_vma->vm_pgoff = pgoff;

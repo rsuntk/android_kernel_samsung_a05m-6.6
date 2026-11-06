@@ -2058,6 +2058,7 @@ no_page:
 
 	if (!folio)
 		return ERR_PTR(-ENOENT);
+	trace_android_vh_filemap_get_folio_end(mapping, folio);
 	return folio;
 }
 EXPORT_SYMBOL(__filemap_get_folio);
@@ -3262,6 +3263,11 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	struct file *fpin = NULL;
 	unsigned long vm_flags = vmf->vma->vm_flags;
 	unsigned int mmap_miss;
+	bool skip = false;
+
+	trace_android_vh_do_sync_mmap_readahead(vmf, &skip);
+	if (skip)
+		return fpin;
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	/* Use the readahead code, even if readahead is disabled */
@@ -3691,6 +3697,7 @@ static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 
 	set_pte_range(vmf, folio, page, 1, addr);
 	folio_ref_inc(folio);
+	trace_android_vh_map_order0_folio(vmf->vma->vm_file, vmf->pgoff, folio, ret);
 
 	return ret;
 }
