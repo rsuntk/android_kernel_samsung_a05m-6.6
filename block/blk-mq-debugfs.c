@@ -728,10 +728,13 @@ void blk_mq_debugfs_unregister_hctx(struct blk_mq_hw_ctx *hctx)
 void blk_mq_debugfs_register_hctxs(struct request_queue *q)
 {
 	struct blk_mq_hw_ctx *hctx;
+	unsigned int memflags;
 	unsigned long i;
 
+	memflags = blk_debugfs_lock(q);
 	queue_for_each_hw_ctx(q, hctx, i)
 		blk_mq_debugfs_register_hctx(q, hctx);
+	blk_debugfs_unlock(q, memflags);
 }
 
 void blk_mq_debugfs_unregister_hctxs(struct request_queue *q)

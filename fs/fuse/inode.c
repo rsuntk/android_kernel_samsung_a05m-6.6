@@ -210,17 +210,19 @@ static ino_t fuse_squash_ino(u64 ino64)
 static void fuse_fill_attr_from_inode(struct fuse_attr *attr,
 				      const struct fuse_inode *fi)
 {
+	struct timespec64 atime = inode_get_atime(&fi->inode);
+	struct timespec64 mtime = inode_get_mtime(&fi->inode);
 	struct timespec64 ctime = inode_get_ctime(&fi->inode);
 
 	*attr = (struct fuse_attr){
 		.ino		= fi->inode.i_ino,
 		.size		= fi->inode.i_size,
 		.blocks		= fi->inode.i_blocks,
-		.atime		= fi->inode.i_atime.tv_sec,
-		.mtime		= fi->inode.i_mtime.tv_sec,
+		.atime		= atime.tv_sec,
+		.mtime		= mtime.tv_sec,
 		.ctime		= ctime.tv_sec,
-		.atimensec	= fi->inode.i_atime.tv_nsec,
-		.mtimensec	= fi->inode.i_mtime.tv_nsec,
+		.atimensec	= atime.tv_nsec,
+		.mtimensec	= mtime.tv_nsec,
 		.ctimensec	= ctime.tv_nsec,
 		.mode		= fi->inode.i_mode,
 		.nlink		= fi->inode.i_nlink,
@@ -257,12 +259,10 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	attr->mtimensec = min_t(u32, attr->mtimensec, NSEC_PER_SEC - 1);
 	attr->ctimensec = min_t(u32, attr->ctimensec, NSEC_PER_SEC - 1);
 
-	inode->i_atime.tv_sec   = attr->atime;
-	inode->i_atime.tv_nsec  = attr->atimensec;
+	inode_set_atime(inode, attr->atime, attr->atimensec);
 	/* mtime from server may be stale due to local buffered write */
 	if (!(cache_mask & STATX_MTIME)) {
-		inode->i_mtime.tv_sec   = attr->mtime;
-		inode->i_mtime.tv_nsec  = attr->mtimensec;
+		inode_set_mtime(inode, attr->mtime, attr->mtimensec);
 	}
 	if (!(cache_mask & STATX_CTIME)) {
 		inode_set_ctime(inode, attr->ctime, attr->ctimensec);
@@ -345,12 +345,12 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
 		attr->size = i_size_read(inode);
 
 	if (cache_mask & STATX_MTIME) {
-		attr->mtime = inode->i_mtime.tv_sec;
-		attr->mtimensec = inode->i_mtime.tv_nsec;
+		attr->mtime = inode_get_mtime_sec(inode);
+		attr->mtimensec = inode_get_mtime_nsec(inode);
 	}
 	if (cache_mask & STATX_CTIME) {
-		attr->ctime = inode_get_ctime(inode).tv_sec;
-		attr->ctimensec = inode_get_ctime(inode).tv_nsec;
+		attr->ctime = inode_get_ctime_sec(inode);
+		attr->ctimensec = inode_get_ctime_nsec(inode);
 	}
 
 	if ((attr_version != 0 && fi->attr_version > attr_version) ||
@@ -359,7 +359,7 @@ void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
 		return;
 	}
 
-	old_mtime = inode->i_mtime;
+	old_mtime = inode_get_mtime(inode);
 	fuse_change_attributes_common(inode, attr, sx, attr_valid, cache_mask);
 
 	oldsize = inode->i_size;
@@ -413,8 +413,7 @@ static void fuse_init_inode(struct inode *inode, struct fuse_attr *attr,
 {
 	inode->i_mode = attr->mode & S_IFMT;
 	inode->i_size = attr->size;
-	inode->i_mtime.tv_sec  = attr->mtime;
-	inode->i_mtime.tv_nsec = attr->mtimensec;
+	inode_set_mtime(inode, attr->mtime, attr->mtimensec);
 	inode_set_ctime(inode, attr->ctime, attr->ctimensec);
 	if (S_ISREG(inode->i_mode)) {
 		fuse_init_common(inode);
@@ -513,16 +512,15 @@ struct inode *fuse_iget_backing(struct super_block *sb, u64 nodeid,
 	if (!inode)
 		return NULL;
 
+	fi = get_fuse_inode(inode);
 	if ((inode->i_state & I_NEW)) {
 		inode->i_flags |= S_NOATIME;
 		if (!fc->writeback_cache)
 			inode->i_flags |= S_NOCMTIME;
-		fuse_init_common(inode);
+		fuse_init_inode(inode, &attr, fc);
 		unlock_new_inode(inode);
 	}
 
-	fi = get_fuse_inode(inode);
-	fuse_init_inode(inode, &attr, fc);
 	spin_lock(&fi->lock);
 	fi->nlookup++;
 	spin_unlock(&fi->lock);
@@ -971,11 +969,19 @@ static int fuse_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 		}
 		break;
 
-	case OPT_ROOT_DIR:
-		ctx->root_dir = fget(result.uint_32);
-		if (!ctx->root_dir)
+	case OPT_ROOT_DIR: {
+		struct file *rd = fget(result.uint_32);
+
+		if (!rd)
 			return invalfc(fsc, "Unable to open root directory");
+		if (rd->f_inode->i_sb->s_magic == FUSE_SUPER_MAGIC ||
+		    rd->f_inode->i_sb->s_stack_depth >= FILESYSTEM_MAX_STACK_DEPTH) {
+			fput(rd);
+			return invalfc(fsc, "Invalid root directory (FUSE or too deep)");
+		}
+		ctx->root_dir = rd;
 		break;
+	}
 
 	case OPT_NO_DAEMON:
 		ctx->no_daemon = true;
@@ -1147,7 +1153,7 @@ static struct inode *fuse_get_root_inode(struct super_block *sb,
 	attr.mode = mode;
 	attr.ino = FUSE_ROOT_ID;
 	attr.nlink = 1;
-	inode = fuse_iget(sb, 1, 0, &attr, 0, 0);
+	inode = fuse_iget(sb, FUSE_ROOT_ID, 0, &attr, 0, 0);
 	if (!inode)
 		return NULL;
 
@@ -1733,6 +1739,8 @@ static int fuse_fill_super_submount(struct super_block *sb,
 
 	fuse_fill_attr_from_inode(&root_attr, parent_fi);
 	root = fuse_iget(sb, parent_fi->nodeid, 0, &root_attr, 0, 0);
+	if (!root)
+		return -ENOMEM;
 	/*
 	 * This inode is just a duplicate, so it is not looked up and
 	 * its nlookup should not be incremented.  fuse_iget() does
@@ -1874,7 +1882,10 @@ int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
 	fc->no_control = ctx->no_control;
 	fc->no_force_umount = ctx->no_force_umount;
 	fc->no_daemon = ctx->no_daemon;
-
+#ifdef CONFIG_FUSE_BPF
+	if (ctx->root_dir)
+		fm->sb->s_stack_depth = ctx->root_dir->f_inode->i_sb->s_stack_depth + 1;
+#endif
 	err = -ENOMEM;
 	root = fuse_get_root_inode(sb, ctx->rootmode, ctx->root_bpf,
 				   ctx->root_dir);

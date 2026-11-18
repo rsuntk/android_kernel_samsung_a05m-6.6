@@ -68,6 +68,7 @@ void dst_init(struct dst_entry *dst, struct dst_ops *ops,
 	dst->lwtstate = NULL;
 	rcuref_init(&dst->__rcuref, initial_ref);
 	INIT_LIST_HEAD(&dst->rt_uncached);
+	dst->rt_uncached_list = NULL;
 	dst->__use = 0;
 	dst->lastuse = jiffies;
 	dst->flags = flags;
@@ -152,7 +153,7 @@ void dst_dev_put(struct dst_entry *dst)
 		dst->ops->ifdown(dst, dev);
 	WRITE_ONCE(dst->input, dst_discard);
 	WRITE_ONCE(dst->output, dst_discard_out);
-	WRITE_ONCE(dst->dev, blackhole_netdev);
+	rcu_assign_pointer(dst->dev, blackhole_netdev);
 	netdev_ref_replace(dev, blackhole_netdev, &dst->dev_tracker,
 			   GFP_ATOMIC);
 }

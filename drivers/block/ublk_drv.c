@@ -40,6 +40,7 @@
 #include <linux/blk-mq.h>
 #include <linux/delay.h>
 #include <linux/mm.h>
+#include <linux/page_size_compat.h>
 #include <asm/page.h>
 #include <linux/task_work.h>
 #include <linux/namei.h>
@@ -572,7 +573,7 @@ static int ublk_validate_params(const struct ublk_device *ub)
 	if (ub->params.types & UBLK_PARAM_TYPE_BASIC) {
 		const struct ublk_param_basic *p = &ub->params.basic;
 
-		if (p->logical_bs_shift > PAGE_SHIFT || p->logical_bs_shift < 9)
+		if (p->logical_bs_shift > __PAGE_SHIFT || p->logical_bs_shift < 9)
 			return -EINVAL;
 
 		if (p->logical_bs_shift > p->physical_bs_shift)
@@ -715,7 +716,7 @@ static inline char *ublk_queue_cmd_buf(struct ublk_device *ub, int q_id)
 
 static inline int __ublk_queue_cmd_buf_size(int depth)
 {
-	return round_up(depth * sizeof(struct ublksrv_io_desc), PAGE_SIZE);
+	return round_up(depth * sizeof(struct ublksrv_io_desc), __PAGE_SIZE);
 }
 
 static inline int ublk_queue_cmd_buf_size(struct ublk_device *ub, int q_id)
@@ -938,8 +939,9 @@ static int ublk_map_io(const struct ublk_queue *ubq, const struct request *req,
 		struct iovec iov;
 		const int dir = ITER_DEST;
 
-		import_single_range(dir, u64_to_user_ptr(io->addr), rq_bytes,
-				&iov, &iter);
+		if (import_single_range(dir, u64_to_user_ptr(io->addr), rq_bytes,
+				&iov, &iter) < 0)
+			return 0;
 
 		return ublk_copy_user_pages(req, 0, &iter, dir);
 	}
@@ -962,8 +964,10 @@ static int ublk_unmap_io(const struct ublk_queue *ubq,
 
 		WARN_ON_ONCE(io->res > rq_bytes);
 
-		import_single_range(dir, u64_to_user_ptr(io->addr), io->res,
-				&iov, &iter);
+		if (import_single_range(dir, u64_to_user_ptr(io->addr), io->res,
+				&iov, &iter) < 0)
+			return 0;
+
 		return ublk_copy_user_pages(req, 0, &iter, dir);
 	}
 	return rq_bytes;
@@ -1099,8 +1103,14 @@ static inline void __ublk_complete_rq(struct request *req)
 	 *
 	 * Re-read simply for this unlikely case.
 	 */
-	if (unlikely(unmapped_bytes < io->res))
+	if (unlikely(unmapped_bytes < io->res)) {
+		if (unlikely(!unmapped_bytes)) {
+			res = BLK_STS_IOERR;
+			goto exit;
+		}
+
 		io->res = unmapped_bytes;
+	}
 
 	/*
 	 * Run bio->bi_end_io() with softirqs disabled. If the final fput
@@ -1128,13 +1138,37 @@ exit:
 	ublk_end_request(req, res);
 }
 
-static void ublk_complete_rq(struct kref *ref)
+static void ublk_do_fail_rq(struct request *req)
+{
+	struct ublk_queue *ubq = req->mq_hctx->driver_data;
+
+	if (ublk_queue_can_use_recovery_reissue(ubq))
+		blk_mq_requeue_request(req, false);
+	else
+		__ublk_complete_rq(req);
+}
+
+static void ublk_fail_rq_fn(struct kref *ref)
 {
 	struct ublk_rq_data *data = container_of(ref, struct ublk_rq_data,
 			ref);
 	struct request *req = blk_mq_rq_from_pdu(data);
 
-	__ublk_complete_rq(req);
+	ublk_do_fail_rq(req);
+}
+
+static void ublk_complete_rq(struct kref *ref)
+{
+	struct ublk_rq_data *data = container_of(ref, struct ublk_rq_data,
+			ref);
+	struct request *req = blk_mq_rq_from_pdu(data);
+	struct ublk_queue *ubq = req->mq_hctx->driver_data;
+
+	/* the abort path's reference may be dropped by another holder last */
+	if (ubq->ios[req->tag].flags & UBLK_IO_FLAG_ABORTED)
+		ublk_do_fail_rq(req);
+	else
+		__ublk_complete_rq(req);
 }
 
 /*
@@ -1152,10 +1186,13 @@ static void __ublk_fail_req(struct ublk_queue *ubq, struct ublk_io *io,
 
 	if (!(io->flags & UBLK_IO_FLAG_ABORTED)) {
 		io->flags |= UBLK_IO_FLAG_ABORTED;
-		if (ublk_queue_can_use_recovery_reissue(ubq))
-			blk_mq_requeue_request(req, false);
-		else
-			ublk_put_req_ref(ubq, req);
+		if (ublk_need_req_ref(ubq)) {
+			struct ublk_rq_data *data = blk_mq_rq_to_pdu(req);
+
+			kref_put(&data->ref, ublk_fail_rq_fn);
+		} else {
+			ublk_do_fail_rq(req);
+		}
 	}
 }
 
@@ -1436,6 +1473,12 @@ static int ublk_ch_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	if (vma->vm_flags & VM_WRITE)
 		return -EPERM;
+
+	/*
+	 * The per-queue command buffer is kernel-written ABI; prevent
+	 * the daemon from upgrading to writable via mprotect().
+	 */
+	vm_flags_clear(vma, VM_MAYWRITE);
 
 	end = UBLKSRV_CMD_BUF_OFFSET + ub->dev_info.nr_hw_queues * max_sz;
 	if (phys_off < UBLKSRV_CMD_BUF_OFFSET || phys_off >= end)
@@ -2181,13 +2224,13 @@ static void ublk_stop_work_fn(struct work_struct *work)
 	ublk_stop_dev(ub);
 }
 
-/* align max io buffer size with PAGE_SIZE */
+/* align max io buffer size with __PAGE_SIZE */
 static void ublk_align_max_io_size(struct ublk_device *ub)
 {
 	unsigned int max_io_bytes = ub->dev_info.max_io_buf_bytes;
 
 	ub->dev_info.max_io_buf_bytes =
-		round_down(max_io_bytes, PAGE_SIZE);
+		round_down(max_io_bytes, __PAGE_SIZE);
 }
 
 static int ublk_add_tag_set(struct ublk_device *ub)
@@ -2436,6 +2479,15 @@ static int ublk_ctrl_add_dev(struct io_uring_cmd *cmd)
 
 	/* update device id */
 	ub->dev_info.dev_id = ub->ub_number;
+
+	/*
+	 * ->state and ->ublksrv_pid are owned by the driver and only read back
+	 * by userspace, but they come from the copied-in dev_info, so reset
+	 * them. Otherwise a device added with ->state != DEAD looks live while
+	 * ->ub_disk is still NULL.
+	 */
+	ub->dev_info.state = UBLK_S_DEV_DEAD;
+	ub->dev_info.ublksrv_pid = -1;
 
 	/*
 	 * 64bit flags will be copied back to userspace as feature
@@ -2908,10 +2960,10 @@ static int ublk_ctrl_uring_cmd(struct io_uring_cmd *cmd,
 	if (issue_flags & IO_URING_F_NONBLOCK)
 		return -EAGAIN;
 
-	ublk_ctrl_cmd_dump(cmd);
-
 	if (!(issue_flags & IO_URING_F_SQE128))
-		goto out;
+		return -EINVAL;
+
+	ublk_ctrl_cmd_dump(cmd);
 
 	ret = ublk_check_cmd_op(cmd_op);
 	if (ret)

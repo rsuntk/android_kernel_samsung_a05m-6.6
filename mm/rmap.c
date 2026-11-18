@@ -215,7 +215,11 @@ int __anon_vma_prepare(struct vm_area_struct *vma)
 	/* page_table_lock to protect against threads */
 	spin_lock(&mm->page_table_lock);
 	if (likely(!vma->anon_vma)) {
-		vma->anon_vma = anon_vma;
+		/*
+		 * Make anon_vma fields visible before anon_vma is published.
+		 * Paired with an address dependency in reusable_anon_vma().
+		 */
+		smp_store_release(&vma->anon_vma, anon_vma);
 		anon_vma_chain_link(vma, avc, anon_vma);
 		anon_vma->num_active_vmas++;
 		allocated = NULL;
@@ -2332,6 +2336,7 @@ static bool try_to_migrate_one(struct folio *folio, struct vm_area_struct *vma,
 				set_src_usage(subpage, SRC_PAGE_MAPPED);
 			trace_set_migration_pte(address, pte_val(swp_pte),
 						compound_order(&folio->page));
+			trace_android_vh_mm_migrate_one_page(subpage, vma->vm_flags);
 			/*
 			 * No need to invalidate here it will synchronize on
 			 * against the special swap migration pte.

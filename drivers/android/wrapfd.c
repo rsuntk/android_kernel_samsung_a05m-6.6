@@ -8,6 +8,7 @@
 
 #include <linux/anon_inodes.h>
 #include <linux/bvec.h>
+#include <linux/compat.h>
 #include <linux/dma-buf.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
@@ -24,6 +25,12 @@
 #include <linux/wrapfd.h>
 #include <uapi/linux/wrapfd.h>
 
+/* 1 buffer for the start, and at most 2 at the end. */
+#define MAX_NR_BOUNCE_BUFS 3
+
+/* 1 per bounce page (3), and 1 for content read directly into the buffer. */
+#define MAX_NR_KVECS (MAX_NR_BOUNCE_BUFS + 1)
+
 struct wrap_ctx;
 struct wrap_content;
 static const struct file_operations wrap_fops;
@@ -32,6 +39,7 @@ struct wrap_content_operations {
 	int (*create_wrap)(struct wrap_content *content, struct wrap_ctx *ctx);
 	int (*load)(struct wrap_content *content, struct file *file,
 		    loff_t file_offs, loff_t buf_offs, loff_t len);
+	loff_t (*llseek)(struct wrap_content *content, loff_t offs, int whence);
 	int (*mmap_prepare)(struct wrap_content *content,
 			    struct vm_area_struct *vma);
 	int (*mmap)(struct wrap_content *content, struct vm_area_struct *vma);
@@ -46,7 +54,6 @@ struct wrap_content_operations {
 			    union wrapfd_mappable *mappable);
 	int (*ioctl)(struct wrap_content *content,
 		     unsigned int cmd, unsigned long arg);
-
 };
 
 /* Abstract wrap content to be embedded in a concrete content object. */
@@ -61,6 +68,67 @@ struct wrap_content_dmabuf {
 	struct dma_buf *dmabuf;
 	bool writable;
 };
+
+struct data_segment {
+	loff_t offs;
+	size_t len;
+};
+
+struct wrap_io_ctx {
+	u8 *bounce_bufs[MAX_NR_BOUNCE_BUFS];
+	u8 *dst_buf;
+	size_t start_bounce_len;
+	size_t end_bounce_len;
+	struct file *file;
+	loff_t buf_offs;
+	struct data_segment file_seg;
+	/* The portion of the buffer that we read the file contents into without bouncing. */
+	struct data_segment dio_buf_seg;
+	long ret;
+	size_t bytes_read;
+	struct wrap_io_req *reqs;
+	unsigned int nr_reqs;
+	spinlock_t lock;
+	struct completion io_done;
+};
+
+struct wrap_io_req {
+	struct kiocb kiocb;
+	struct iov_iter iter;
+	struct kvec iov[MAX_NR_KVECS];
+	struct data_segment file_seg;
+	struct wrap_io_ctx *io_ctx;
+};
+
+struct dmabuf_load_param {
+	struct dma_buf *dmabuf;
+	struct iosys_map map;
+	struct wrap_io_ctx io_ctx;
+};
+
+static int nonzero_ulong_param_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned long res;
+	int ret = kstrtoul(val, 0, &res);
+
+	if (ret)
+		return ret;
+	if (!res)
+		return -EINVAL;
+	*((unsigned long *)kp->arg) = res;
+	return 0;
+}
+
+static const struct kernel_param_ops nonzero_param_ops = {
+	.set = nonzero_ulong_param_set,
+	.get = param_get_ulong,
+};
+
+static unsigned long max_nr_load_reqs = 32;
+module_param_cb(max_nr_load_reqs, &nonzero_param_ops, &max_nr_load_reqs, 0644);
+
+static unsigned long min_bytes_per_req = SZ_1M;
+module_param_cb(min_bytes_per_req, &nonzero_param_ops, &min_bytes_per_req, 0644);
 
 static int dmabuf_content_create_wrap(struct wrap_content *content,
 				      struct wrap_ctx *ctx)
@@ -94,33 +162,401 @@ static int dmabuf_content_create_wrap(struct wrap_content *content,
 	return fd;
 }
 
-static int dmabuf_content_load(struct wrap_content *content, struct file *file,
-			       loff_t file_offs, loff_t buf_offs, loff_t len)
+static size_t dio_aligned_len(loff_t file_offs, size_t len)
 {
-	struct wrap_content_dmabuf *dmabuf_content;
+	/*
+	 * File offset and read length must be page aligned for direct I/O requests, so page align
+	 * the start and end of the read to figure out how much we'll actually be reading from the
+	 * file.
+	 */
+	return PAGE_ALIGN(file_offs + len) - PAGE_ALIGN_DOWN(file_offs);
+}
+
+static void async_io_complete(struct kiocb *kiocb, long ret)
+{
+	struct wrap_io_req *req = container_of(kiocb, struct wrap_io_req, kiocb);
+	struct wrap_io_ctx *io_ctx = req->io_ctx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&io_ctx->lock, flags);
+	if (ret < 0 && !io_ctx->ret)
+		io_ctx->ret = ret;
+	else
+		io_ctx->bytes_read += ret;
+
+	io_ctx->nr_reqs--;
+
+	if (!io_ctx->nr_reqs)
+		complete(&io_ctx->io_done);
+	spin_unlock_irqrestore(&io_ctx->lock, flags);
+}
+
+static void init_io_req(struct wrap_io_ctx *io_ctx, struct wrap_io_req *req, loff_t req_file_offs,
+			size_t req_len)
+{
+	unsigned int nr_segs = 0;
+	loff_t global_file_offset;
+	loff_t global_dio_file_offset;
+
+	/*
+	 * These are global in the context of the overall I/O request. The first represents the
+	 * offset into the file at which we start reading from for the overall request. The second
+	 * is the offset at which we read from the file directly into the destination buffer.
+	 */
+	global_file_offset = PAGE_ALIGN_DOWN(io_ctx->file_seg.offs);
+	global_dio_file_offset = global_file_offset + io_ctx->start_bounce_len;
+
+	init_sync_kiocb(&req->kiocb, io_ctx->file);
+	req->kiocb.ki_pos = req_file_offs;
+	req->kiocb.ki_flags |= IOCB_DIRECT;
+	req->kiocb.ki_complete = async_io_complete;
+	req->file_seg.offs = req_file_offs;
+	req->file_seg.len = req_len;
+	req->io_ctx = io_ctx;
+
+	/*
+	 * If there's a start bounce buffer, it's always for the first page in the overall read
+	 * request.
+	 */
+	if (io_ctx->start_bounce_len && (req_file_offs == global_file_offset)) {
+		req->iov[nr_segs].iov_base = io_ctx->bounce_bufs[0];
+		req->iov[nr_segs].iov_len = io_ctx->start_bounce_len;
+		req_len -= io_ctx->start_bounce_len;
+		req_file_offs += io_ctx->start_bounce_len;
+		nr_segs++;
+	}
+
+	/*
+	 * Handle the case where the sub-request pertains to data copied directly from the file to
+	 * the destination buffer.
+	 */
+	if (req_len && io_ctx->dio_buf_seg.len && global_dio_file_offset <= req_file_offs) {
+		size_t dio_len;
+
+		/*
+		 * The offset into the buffer for this request should be the base of where we start
+		 * reading directly into it, plus how much we've already read into the region in
+		 * previous requests.
+		 */
+		req->iov[nr_segs].iov_base = io_ctx->dst_buf + io_ctx->dio_buf_seg.offs +
+					     (req_file_offs - global_dio_file_offset);
+		/*
+		 * The amount of data to read is the smaller of the two terms:
+		 *
+		 * 1. How much data is left for this request.
+		 * 2. How much data there is left in the file region that gets loaded directly
+		 * into the buffer, which is taken as the difference between the current position
+		 * in the file and the end of that region.
+		 */
+		dio_len = min_t(size_t, req_len, global_dio_file_offset + io_ctx->dio_buf_seg.len -
+				req_file_offs);
+		req->iov[nr_segs].iov_len = dio_len;
+		req_len -= dio_len;
+		req_file_offs += dio_len;
+		nr_segs++;
+	}
+
+	if (req_len && io_ctx->end_bounce_len) {
+		/*
+		 * The offset into the file that is copied into the end bounce buffer(s) for the
+		 * overall request.
+		 */
+		loff_t global_end_bounce_file_offs = global_file_offset +
+						dio_aligned_len(io_ctx->file_seg.offs,
+								io_ctx->file_seg.len) -
+						io_ctx->end_bounce_len;
+		int start_bounce_idx;
+
+		/*
+		 * The last two pages in the overall read request can be bounce pages, so we
+		 * calculate which pages to use here. If there's a bounce page at the beginning,
+		 * then start at index 1.
+		 *
+		 * Since we know the file offset that corresponds to the start of the file data
+		 * that will be copied into the end pages and the length, we use that and our
+		 * current position to track which one of the end pages to use.
+		 */
+		start_bounce_idx = (io_ctx->start_bounce_len ? 1 : 0) +
+				   ((req_file_offs - global_end_bounce_file_offs) / PAGE_SIZE);
+
+		WARN_ON(req_len > PAGE_SIZE * 2);
+
+		while (req_len) {
+			req->iov[nr_segs].iov_base = io_ctx->bounce_bufs[start_bounce_idx];
+			req->iov[nr_segs].iov_len = PAGE_SIZE;
+			req_len -= PAGE_SIZE;
+			nr_segs++;
+			start_bounce_idx++;
+		}
+	}
+
+	WARN_ON(req_len);
+
+	iov_iter_kvec(&req->iter, ITER_DEST, req->iov, nr_segs, req->file_seg.len);
+}
+
+static int prepare_read_reqs(struct wrap_io_ctx *io_ctx)
+{
+	struct wrap_io_req *reqs;
+	unsigned int nr_reqs, i;
+	loff_t cur_file_offs;
+	size_t remaining_len = dio_aligned_len(io_ctx->file_seg.offs, io_ctx->file_seg.len);
+	size_t len_per_req;
+
+	/*
+	 * Try to split the I/O request evenly into MAX_NR_LOAD_REQS pieces, as long as each piece
+	 * is at least MIN_BYTES_PER_REQ in size, but no larger than MAX_RW_COUNT, since the VFS
+	 * layer cannot handle anything larger than that in one invocation.
+	 *
+	 * PAGE_ALIGN the length to ensure direct I/O requirements are upheld.
+	 */
+	len_per_req = PAGE_ALIGN(clamp_t(size_t, remaining_len / max_nr_load_reqs,
+					 min_bytes_per_req, MAX_RW_COUNT));
+
+	nr_reqs = DIV_ROUND_UP(remaining_len, len_per_req);
+
+	/* nr_reqs could be large, so use kvcalloc() just in case. */
+	reqs = kvcalloc(nr_reqs, sizeof(*reqs), GFP_KERNEL);
+	if (!reqs)
+		return -ENOMEM;
+
+	cur_file_offs = PAGE_ALIGN_DOWN(io_ctx->file_seg.offs);
+
+	for (i = 0; i < nr_reqs; i++) {
+		size_t req_len = min(len_per_req, remaining_len);
+
+		init_io_req(io_ctx, &reqs[i], cur_file_offs, req_len);
+		cur_file_offs += req_len;
+		remaining_len -= req_len;
+	}
+
+	io_ctx->reqs = reqs;
+	io_ctx->nr_reqs = nr_reqs;
+	return 0;
+}
+
+/*
+ * Splits an I/O request into at most 4 segments: a start bounce page for when the file or
+ * buffer offsets are unaligned to avoid overwriting any of the existing data in the first page,
+ * a middle segment that writes directly into the buffer, and a final segment that covers the
+ * remainder with at most 2 bounce pages.
+ *
+ * When using bounce pages, a full page is copied from the file as part of the I/O request, and only
+ * the parts that are needed are copied into the buffer later. Since the first page of the I/O
+ * request may also need to be bounced, the middle segment of the I/O request, which is read
+ * directly into the buffer if there is enough space, may need to be moved back to its final
+ * destination, which also happens later.
+ *
+ * All of the logic to shuttle the buffer contents to their final destination is in
+ * wrap_io_complete().
+ */
+static int wrap_io_prepare(struct file *file, loff_t file_offs, u8 *dst_buf, loff_t buf_offs,
+			   loff_t len, struct wrap_io_ctx *io_ctx)
+{
+	u8 *bounce_bufs[MAX_NR_BOUNCE_BUFS] = {};
+	size_t start_bounce_len = 0;
+	loff_t dio_buf_offs = buf_offs;
+	size_t dio_buf_len = 0;
+	loff_t dio_buf_limit;
+	size_t end_bounce_len;
+	size_t nr_bounce_pages;
+	size_t file_read_len = dio_aligned_len(file_offs, len);
+	loff_t buf_end = buf_offs + len;
+	int i, ret = 0;
+
+	/*
+	 * If either the file or buffer offset are unaligned, then using direct I/O into the first
+	 * page of the buffer will overwrite some of the data that is already there. Allocate a
+	 * bounce page for that scenario, and later only copy the amount of data that belongs in the
+	 * first page.
+	 */
+	if (!PAGE_ALIGNED(file_offs | buf_offs)) {
+		/*
+		 * The contents of interest in this bounce page will be copied to the buffer
+		 * starting at buf_offs after the direct I/O request completes. The amount of data
+		 * copied will be everything in the bounce page after file_offset bytes.
+		 *
+		 * Therefore, the next address where data needs to be read into is buf_offs +
+		 * (PAGE_SIZE - offset_in_page(file_offs)). However, this address may not be
+		 * page aligned, and therefore not suitable for direct I/O, so page align it.
+		 *
+		 * This means that the data will need to be shifted backwards if it is read into
+		 * the buffer directly.
+		 */
+		dio_buf_offs = PAGE_ALIGN(buf_offs + PAGE_SIZE - offset_in_page(file_offs));
+		start_bounce_len = PAGE_SIZE;
+	}
+
+	/*
+	 * Read as much as possible directly into the buffer without causing any overwrites beyond
+	 * the range we're reading into, and since direct I/O is done in units of pages,
+	 * ensure that there is at least a page to read.
+	 */
+	if (!check_sub_overflow(buf_end, PAGE_SIZE, &dio_buf_limit) &&
+	    dio_buf_offs <= dio_buf_limit)
+		dio_buf_len = PAGE_ALIGN_DOWN(buf_end) - dio_buf_offs;
+
+	/*
+	 * Bounce the remainder, which is capped at 2 pages, since we may have shifted the data
+	 * earlier, because of the buffer offset by at most one page, and then any other data
+	 * at the tail which may cross into another page.
+	 */
+	end_bounce_len = file_read_len - start_bounce_len - dio_buf_len;
+	WARN_ON(end_bounce_len > PAGE_SIZE * 2);
+
+	nr_bounce_pages = (start_bounce_len + end_bounce_len) / PAGE_SIZE;
+	for (i = 0; i < nr_bounce_pages; i++) {
+		bounce_bufs[i] = (u8 *)__get_free_page(GFP_KERNEL);
+		if (!bounce_bufs[i]) {
+			ret = -ENOMEM;
+			goto err_free_bounce_pages;
+		}
+	}
+
+	memset(io_ctx, 0, sizeof(*io_ctx));
+	memcpy(io_ctx->bounce_bufs, bounce_bufs, sizeof(io_ctx->bounce_bufs));
+	io_ctx->dst_buf = dst_buf;
+	io_ctx->start_bounce_len = start_bounce_len;
+	io_ctx->end_bounce_len = end_bounce_len;
+	io_ctx->file = file;
+	io_ctx->buf_offs = buf_offs;
+	io_ctx->file_seg.offs = file_offs;
+	io_ctx->file_seg.len = len;
+	io_ctx->dio_buf_seg.offs = dio_buf_offs;
+	io_ctx->dio_buf_seg.len = dio_buf_len;
+	spin_lock_init(&io_ctx->lock);
+	init_completion(&io_ctx->io_done);
+
+	ret = prepare_read_reqs(io_ctx);
+	if (ret)
+		goto err_free_bounce_pages;
+
+	return 0;
+
+err_free_bounce_pages:
+	/* free_page() checks that the provided address is not NULL. */
+	for (i = 0; i < nr_bounce_pages; i++)
+		free_page((unsigned long)bounce_bufs[i]);
+	return ret;
+
+}
+
+static int wrap_io_read(struct wrap_io_ctx *io_ctx)
+{
+	ssize_t ret;
+	unsigned int i, nr_reqs;
+
+	/*
+	 * io_ctx->nr_reqs is manipulated from async_io_complete(), to determine when the I/O is
+	 * complete, so cache it before it can be manipulated. No lock is required here since we
+	 * haven't started reading anything yet.
+	 */
+	nr_reqs = io_ctx->nr_reqs;
+
+	for (i = 0; i < nr_reqs; i++) {
+		struct wrap_io_req *req = &io_ctx->reqs[i];
+
+		/*
+		 * ret == -EIOCBQUEUED => I/O request was queued successfully.
+		 * ret >= 0 => I/O request was satisfied synchronously.
+		 * ret < 0 => error.
+		 *
+		 * If an error is encountered, record the first one. We have to call
+		 * async_io_complete() if the request is not being processed asynchronously to
+		 * ensure that the nr_reqs context field is decremented properly so that we don't
+		 * block indefinitely in the wait_for_completion() call later.
+		 */
+		ret = vfs_iocb_iter_read(io_ctx->file, &req->kiocb, &req->iter);
+		if (ret != -EIOCBQUEUED)
+			async_io_complete(&req->kiocb, ret);
+	}
+
+	wait_for_completion(&io_ctx->io_done);
+
+	if (io_ctx->ret)
+		return io_ctx->ret;
+
+	/* File was too short / early EOF. */
+	return io_ctx->bytes_read < offset_in_page(io_ctx->file_seg.offs) + io_ctx->file_seg.len ?
+	       -EINVAL : 0;
+}
+
+static void wrap_io_complete(struct wrap_io_ctx *io_ctx)
+{
+	u8 *dst, *src, *dio_start;
+	size_t tot_len, len;
+	unsigned int cur_bounce_page = 0;
+	loff_t file_offs = io_ctx->file_seg.offs;
+	int i;
+
+	if (io_ctx->bytes_read < (offset_in_page(file_offs) + io_ctx->file_seg.len))
+		goto out;
+
+	tot_len = io_ctx->file_seg.len;
+	dst = io_ctx->dst_buf + io_ctx->buf_offs;
+
+	if (io_ctx->start_bounce_len) {
+		src = io_ctx->bounce_bufs[cur_bounce_page] + offset_in_page(file_offs);
+		/* Handle the case where all of the requested data is in the first bounce page. */
+		len = min(tot_len, PAGE_SIZE - offset_in_page(file_offs));
+		memcpy(dst, src, len);
+		dst += len;
+		tot_len -= len;
+		cur_bounce_page++;
+	}
+
+	if (io_ctx->dio_buf_seg.len) {
+		dio_start = io_ctx->dst_buf + io_ctx->dio_buf_seg.offs;
+		len = min(tot_len, io_ctx->dio_buf_seg.len);
+
+		/*
+		 * If there's anything that was copied directly into the dmabuf, check to make sure
+		 * it's in the right place. Shift it back if it's not.
+		 */
+		if (dio_start != dst)
+			memmove(dst, dio_start, len);
+
+		dst += len;
+		tot_len -= len;
+	}
+
+	for (i = 0; i < io_ctx->end_bounce_len / PAGE_SIZE; i++) {
+		src = io_ctx->bounce_bufs[cur_bounce_page];
+		len = min_t(size_t, tot_len, PAGE_SIZE);
+		memcpy(dst, src, len);
+		dst += len;
+		tot_len -= len;
+		cur_bounce_page++;
+	}
+
+	WARN_ON(tot_len);
+
+out:
+	kvfree(io_ctx->reqs);
+	for (i = 0; i < ((io_ctx->start_bounce_len + io_ctx->end_bounce_len) / PAGE_SIZE); i++)
+		free_page((unsigned long)io_ctx->bounce_bufs[i]);
+
+}
+
+static int dmabuf_content_load_prepare(struct file *file, struct dma_buf *dmabuf, loff_t file_offs,
+				       loff_t buf_offs, loff_t len, struct dmabuf_load_param *param)
+{
 	struct iosys_map map;
-	struct iov_iter iter;
-	struct kiocb kiocb;
-	loff_t bytes_read;
-	struct kvec iov;
-	loff_t end;
+	loff_t buf_end;
 	int ret;
 
-	dmabuf_content = container_of(content, struct wrap_content_dmabuf,
-				      content);
-
-	if (check_add_overflow(buf_offs, len, &end))
+	/* We will only write into buf_offs + len, so no need to page-align the length here. */
+	if (check_add_overflow(buf_offs, len, &buf_end))
 		return -EINVAL;
 
-	if (end > dmabuf_content->dmabuf->size)
+	if (buf_end > dmabuf->size)
 		return -EINVAL;
 
-	ret = dma_buf_begin_cpu_access(dmabuf_content->dmabuf,
-				       DMA_BIDIRECTIONAL);
+	ret = dma_buf_begin_cpu_access(dmabuf, DMA_BIDIRECTIONAL);
 	if (ret)
 		return ret;
 
-	ret = dma_buf_vmap(dmabuf_content->dmabuf, &map);
+	ret = dma_buf_vmap_unlocked(dmabuf, &map);
 	if (ret)
 		goto err_end_access;
 
@@ -129,41 +565,45 @@ static int dmabuf_content_load(struct wrap_content *content, struct file *file,
 		goto err_unmap;
 	}
 
-	iov.iov_base = (u8 *)map.vaddr + buf_offs;
-	init_sync_kiocb(&kiocb, file);
-	kiocb.ki_pos = file_offs;
-	kiocb.ki_flags |= IOCB_DIRECT;
+	ret = wrap_io_prepare(file, file_offs, map.vaddr, buf_offs, len, &param->io_ctx);
+	if (ret < 0)
+		goto err_unmap;
 
-	while (len) {
-		loff_t count = min_t(loff_t, MAX_RW_COUNT, len);
+	param->dmabuf = dmabuf;
+	param->map = map;
+	return 0;
 
-		iov.iov_len = count;
-		iov_iter_kvec(&iter, ITER_DEST, &iov, 1, iov.iov_len);
-		bytes_read = 0;
-		while (bytes_read < count) {
-			ssize_t sz = vfs_iocb_iter_read(file, &kiocb, &iter);
-
-			if (sz <= 0) {
-				ret = sz;
-				goto err_unmap;
-			}
-			bytes_read += sz;
-		}
-		iov.iov_base += count;
-		len -= count;
-	}
 err_unmap:
-	dma_buf_vunmap(dmabuf_content->dmabuf, &map);
+	dma_buf_vunmap_unlocked(dmabuf, &map);
 err_end_access:
-	dma_buf_end_cpu_access(dmabuf_content->dmabuf, DMA_BIDIRECTIONAL);
+	dma_buf_end_cpu_access(dmabuf, DMA_BIDIRECTIONAL);
+	return ret;
+}
 
+static void dmabuf_content_load_complete(struct dmabuf_load_param *param)
+{
+	wrap_io_complete(&param->io_ctx);
+	dma_buf_vunmap_unlocked(param->dmabuf, &param->map);
+	dma_buf_end_cpu_access(param->dmabuf, DMA_BIDIRECTIONAL);
+}
+
+static int dmabuf_content_load(struct wrap_content *content, struct file *file,
+			       loff_t file_offs, loff_t buf_offs, loff_t len)
+{
+	struct wrap_content_dmabuf *dmabuf_content;
+	struct dmabuf_load_param param;
+	int ret;
+
+	dmabuf_content = container_of(content, struct wrap_content_dmabuf,
+				      content);
+	ret = dmabuf_content_load_prepare(file, dmabuf_content->dmabuf, file_offs, buf_offs, len,
+					  &param);
 	if (ret < 0)
 		return ret;
 
-	if (len)
-		return -EINVAL; /* File was too short / early EOF */
-
-	return 0;
+	ret = wrap_io_read(&param.io_ctx);
+	dmabuf_content_load_complete(&param);
+	return ret;
 }
 
 static struct wrap_content *
@@ -173,6 +613,9 @@ dmabuf_content_make_writable(struct wrap_content *content, bool writable)
 
 	dmabuf_content = container_of(content, struct wrap_content_dmabuf,
 				      content);
+	if (writable && !(dmabuf_content->dmabuf->file->f_mode & FMODE_WRITE))
+		return ERR_PTR(-EACCES);
+
 	dmabuf_content->writable = writable;
 
 	return content;
@@ -185,7 +628,19 @@ static bool dmabuf_content_is_writable(struct wrap_content *content)
 	dmabuf_content = container_of(content, struct wrap_content_dmabuf,
 				      content);
 
-	return dmabuf_content->writable;
+	return dmabuf_content->writable && !!(dmabuf_content->dmabuf->file->f_mode & FMODE_WRITE);
+}
+
+static loff_t dmabuf_content_llseek(struct wrap_content *content, loff_t offs, int whence)
+{
+	struct wrap_content_dmabuf *dmabuf_content;
+	struct file *file;
+
+	dmabuf_content = container_of(content, struct wrap_content_dmabuf,
+				      content);
+	file = dmabuf_content->dmabuf->file;
+
+	return file->f_op->llseek(file, offs, whence);
 }
 
 static int dmabuf_content_mmap(struct wrap_content *content,
@@ -197,7 +652,7 @@ static int dmabuf_content_mmap(struct wrap_content *content,
 	dmabuf_content = container_of(content, struct wrap_content_dmabuf,
 				      content);
 
-	ret = dma_buf_mmap(dmabuf_content->dmabuf, vma, 0);
+	ret = dma_buf_mmap(dmabuf_content->dmabuf, vma, vma->vm_pgoff);
 	if (ret)
 		return ret;
 
@@ -259,12 +714,17 @@ static int dmabuf_content_ioctl(struct wrap_content *content,
 				      content);
 	file = dmabuf_content->dmabuf->file;
 
+	if (in_compat_syscall())
+		return file->f_op->compat_ioctl(file, cmd, arg);
+
 	return file->f_op->unlocked_ioctl(file, cmd, arg);
+
 }
 
 static struct wrap_content_operations dmabuf_content_ops = {
 	.create_wrap		= dmabuf_content_create_wrap,
 	.load			= dmabuf_content_load,
+	.llseek			= dmabuf_content_llseek,
 	.mmap			= dmabuf_content_mmap,
 	.make_writable		= dmabuf_content_make_writable,
 	.is_writable		= dmabuf_content_is_writable,
@@ -281,7 +741,7 @@ static struct wrap_content *alloc_dmabuf_content(struct dma_buf *dmabuf,
 
 	dmabuf_content = kmalloc(sizeof(*dmabuf_content), GFP_KERNEL);
 	if (!dmabuf_content)
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 
 	get_dma_buf(dmabuf);
 	dmabuf_content->dmabuf = dmabuf;
@@ -299,13 +759,11 @@ struct wrap_owner {
 
 struct wrap_ctx_mapping {
 	refcount_t refcnt;
+	struct file *file;
 	struct wrap_ctx *ctx;
 	const struct vm_operations_struct *content_vm_ops;
 	struct vm_operations_struct vm_ops;
 };
-
-#define OP_BLOCKED_MODIFICATION	BIT(0)
-#define OP_BLOCKED_MAPPING	BIT(1)
 
 struct wrap_ctx {
 	struct wrap_content *content;
@@ -313,11 +771,8 @@ struct wrap_ctx {
 	struct wrap_owner owner;
 	bool allow_guests;
 	unsigned long map_count;
-	/*
-	 * Mask of blocked operations when lock is not held due to possiblity
-	 * of sleep during the ongoing operation.
-	 */
-	unsigned int block_mask;
+	unsigned long use_count;
+	bool unusable;
 };
 
 static struct wrap_ctx *create_wrap_ctx(void)
@@ -333,17 +788,38 @@ static struct wrap_ctx *create_wrap_ctx(void)
 	return ctx;
 }
 
-static inline bool is_owner(struct wrap_ctx *ctx)
+static inline void reset_owner(struct wrap_ctx *ctx)
 {
 	assert_spin_locked(&ctx->lock);
-	return ctx->owner.task || ctx->owner.dev;
+	put_task_struct(ctx->owner.task);
+	ctx->owner.task = NULL;
+}
+
+static inline struct task_struct *get_valid_owner(struct wrap_ctx *ctx)
+{
+	assert_spin_locked(&ctx->lock);
+
+	if (!ctx->owner.task)
+		return NULL;
+
+	/* If task exits (passed exit_mm), reset the owner. */
+	if (!ctx->owner.task->mm)
+		reset_owner(ctx);
+
+	return ctx->owner.task;
+}
+
+static inline bool has_owner(struct wrap_ctx *ctx)
+{
+	return get_valid_owner(ctx) || ctx->owner.dev;
 }
 
 static inline bool is_owner_task(struct wrap_ctx *ctx,
 				 struct task_struct *task)
 {
-	assert_spin_locked(&ctx->lock);
-	return ctx->owner.task && ctx->owner.task->mm == task->mm;
+	struct task_struct *owner_task = get_valid_owner(ctx);
+
+	return owner_task && task->group_leader == owner_task;
 }
 
 static inline bool is_owner_dev(struct wrap_ctx *ctx,
@@ -367,14 +843,31 @@ static inline int publish_wrap(struct wrap_ctx *ctx,
 	return ret;
 }
 
-static int can_access(struct wrap_ctx *ctx, struct task_struct *task,
+static bool context_use(struct wrap_ctx *ctx)
+{
+	assert_spin_locked(&ctx->lock);
+	if (ctx->unusable)
+		return false;
+	ctx->use_count++;
+	return true;
+}
+
+static void context_unuse(struct wrap_ctx *ctx)
+{
+	assert_spin_locked(&ctx->lock);
+	if (WARN_ON(ctx->unusable))
+		return;
+	ctx->use_count--;
+}
+
+static int can_modify(struct wrap_ctx *ctx, struct task_struct *task,
 		      bool check_content)
 {
 	assert_spin_locked(&ctx->lock);
 	if (!is_owner_task(ctx, task))
 		return -EBUSY;
 
-	if (ctx->map_count > 0)
+	if (ctx->map_count > 0 || ctx->use_count > 0)
 		return -EINVAL;
 
 	if (check_content && !ctx->content)
@@ -383,45 +876,35 @@ static int can_access(struct wrap_ctx *ctx, struct task_struct *task,
 	return 0;
 }
 
-static bool can_map(struct wrap_ctx *ctx)
-{
-	assert_spin_locked(&ctx->lock);
-	return (ctx->block_mask & OP_BLOCKED_MAPPING) == 0;
-}
-
-static int block_operations(struct wrap_ctx *ctx, unsigned int mask)
+static int block_usage(struct wrap_ctx *ctx)
 {
 	int ret;
 
 	assert_spin_locked(&ctx->lock);
-	/* Any request should at least block modifications. */
-	if (WARN_ON((mask & OP_BLOCKED_MODIFICATION) == 0))
-		return -EINVAL;
-
-	ret = can_access(ctx, current, true);
+	ret = can_modify(ctx, current, true);
 	if (ret)
 		return ret;
 
 	/*
 	 * The task is the owner, the content can't be modified by other
 	 * processes but racing threads of the owner process can still
-	 * modify it. Use block_mask bitmask to prevent that.
+	 * modify it. Use unusable to prevent that.
 	 */
-	if (ctx->block_mask & mask)
+	if (ctx->unusable)
 		return -EAGAIN;
 
-	ctx->block_mask |= mask;
+	ctx->unusable = true;
 
 	return 0;
 }
 
-static void unblock_operations(struct wrap_ctx *ctx)
+static void unblock_usage(struct wrap_ctx *ctx)
 {
 	assert_spin_locked(&ctx->lock);
-	if (WARN_ON(!ctx->block_mask))
+	if (WARN_ON(!ctx->unusable))
 		return;
 
-	ctx->block_mask = 0;
+	ctx->unusable = false;
 }
 
 static void wrap_vm_open(struct vm_area_struct *vma)
@@ -441,6 +924,7 @@ static void wrap_vm_open(struct vm_area_struct *vma)
 static void wrap_vm_close(struct vm_area_struct *vma)
 {
 	struct wrap_ctx_mapping *mapping;
+	struct file *file = NULL;
 	struct wrap_ctx *ctx;
 
 	mapping = container_of(vma->vm_ops, struct wrap_ctx_mapping, vm_ops);
@@ -453,9 +937,14 @@ static void wrap_vm_close(struct vm_area_struct *vma)
 		ctx->map_count--;
 	else
 		pr_warn("wrapfd map count underflow\n");
-	if (refcount_dec_and_test(&mapping->refcnt))
+	if (refcount_dec_and_test(&mapping->refcnt)) {
+		if (mapping->file)
+			file = mapping->file;
 		kfree(mapping);
+	}
 	spin_unlock(&ctx->lock);
+	if (file)
+		fput(file);
 }
 
 static int wrap_mmap(struct file *file, struct vm_area_struct *vma)
@@ -467,17 +956,17 @@ static int wrap_mmap(struct file *file, struct vm_area_struct *vma)
 	int ret = 0;
 
 	spin_lock(&ctx->lock);
-	if (!ctx->allow_guests && is_owner(ctx) &&
+	if (!ctx->allow_guests && has_owner(ctx) &&
 	    !is_owner_task(ctx, current)) {
 		ret = -EBUSY;
 		goto unlock;
 	}
 
 	/*
-	 * If mappings are blocked the content is being rewrapped or emptied.
+	 * If usage is blocked, the content is being rewrapped or emptied.
 	 * Treat this as if the wrap is already empty.
 	 */
-	if (!can_map(ctx)) {
+	if (!context_use(ctx)) {
 		ret = -ENOENT;
 		goto unlock;
 	}
@@ -485,7 +974,7 @@ static int wrap_mmap(struct file *file, struct vm_area_struct *vma)
 	content = ctx->content;
 	if (!content) {
 		ret = -ENOENT;
-		goto unlock;
+		goto put_ctx;
 	}
 
 	/* Handle read-only content */
@@ -493,7 +982,7 @@ static int wrap_mmap(struct file *file, struct vm_area_struct *vma)
 	    !content->ops->is_writable(content)) {
 		if (vma->vm_flags & VM_WRITE) {
 			ret = -EACCES;
-			goto unlock;
+			goto put_ctx;
 		}
 		make_rdonly = !!(vma->vm_flags & VM_MAYWRITE);
 	}
@@ -502,15 +991,17 @@ static int wrap_mmap(struct file *file, struct vm_area_struct *vma)
 		ret = content->ops->mmap_prepare(content, vma);
 		if (ret) {
 			ret = -EINVAL;
-			goto unlock;
+			goto put_ctx;
 		}
 	}
 	/*
 	 * Increased map_count prevents changes in the
 	 * ownership, rewrapping or emptying the content.
-	 * Therefore content is stable.
+	 * Content is stable.
 	 */
 	ctx->map_count++;
+put_ctx:
+	context_unuse(ctx);
 unlock:
 	spin_unlock(&ctx->lock);
 
@@ -551,6 +1042,14 @@ unlock:
 	vma->vm_ops = &mapping->vm_ops;
 	mapping->ctx = ctx;
 	refcount_set(&mapping->refcnt, 1);
+	/*
+	 * content->ops->mmap might replace original vma->vm_file and vma will
+	 * lose its association with the wrapfd file. In such cases we need to
+	 * take a reference on the wrapfd file and store it to drop the
+	 * refcount mapping is removed.
+	 */
+	if (vma->vm_file != file)
+		mapping->file = get_file(file);
 	spin_unlock(&ctx->lock);
 
 	return 0;
@@ -561,6 +1060,47 @@ err_dec:
 	ctx->map_count--;
 	spin_unlock(&ctx->lock);
 err:
+	return ret;
+}
+
+static loff_t wrap_llseek(struct file *file, loff_t offs, int whence)
+{
+	struct wrap_ctx *ctx = file->private_data;
+	struct wrap_content *content;
+	loff_t ret = 0;
+
+	spin_lock(&ctx->lock);
+	/*
+	 * If usage is blocked, the content is being rewrapped or emptied.
+	 * Treat this as if the wrap is already empty.
+	 */
+	if (!context_use(ctx)) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	content = ctx->content;
+	if (!content) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	if (!content->ops->llseek) {
+		ret = -ESPIPE;
+		goto unlock;
+	}
+unlock:
+	spin_unlock(&ctx->lock);
+
+	if (ret)
+		return ret;
+
+	ret = content->ops->llseek(content, offs, whence);
+
+	spin_lock(&ctx->lock);
+	context_unuse(ctx);
+	spin_unlock(&ctx->lock);
+
 	return ret;
 }
 
@@ -589,14 +1129,15 @@ static int get_wrap_state(struct wrap_ctx *ctx,
 
 	spin_lock(&ctx->lock);
 	/*
-	 * If mappings are blocked the content is being rewrapped or emptied.
+	 * If usage is blocked, the content is being rewrapped or emptied.
 	 * Treat this as if the wrap is already empty.
 	 */
-	if (ctx->content && can_map(ctx)) {
+	if (ctx->content && context_use(ctx)) {
 		if (ctx->content->ops->is_writable(ctx->content))
 			wrapfd_get_state.state = WRAPFD_CONTENT_RDWR;
 		else
 			wrapfd_get_state.state = WRAPFD_CONTENT_RDONLY;
+		context_unuse(ctx);
 	} else {
 		wrapfd_get_state.state = WRAPFD_CONTENT_EMPTY;
 	}
@@ -618,12 +1159,12 @@ static int wrap_file_acquire_ownership(struct wrap_ctx *ctx)
 	if (is_owner_task(ctx, current))
 		goto unlock;
 
-	if (is_owner(ctx)) {
+	if (has_owner(ctx)) {
 		ret = -EBUSY;
 		goto unlock;
 	}
 
-	if (ctx->map_count > 0) {
+	if (ctx->map_count > 0 || ctx->use_count > 0) {
 		ret = -EINVAL;
 		goto unlock;
 	}
@@ -633,7 +1174,7 @@ static int wrap_file_acquire_ownership(struct wrap_ctx *ctx)
 		goto unlock;
 	}
 
-	ctx->owner.task = current;
+	ctx->owner.task = get_task_struct(current->group_leader);
 unlock:
 	spin_unlock(&ctx->lock);
 
@@ -646,11 +1187,11 @@ static int wrap_file_release_ownership(struct wrap_ctx *ctx)
 
 	spin_lock(&ctx->lock);
 
-	ret = can_access(ctx, current, false);
+	ret = can_modify(ctx, current, false);
 	if (ret)
 		goto unlock;
 
-	ctx->owner.task = NULL;
+	reset_owner(ctx);
 	ctx->allow_guests = false;
 unlock:
 	spin_unlock(&ctx->lock);
@@ -662,7 +1203,11 @@ static int wrap_file_load(struct wrap_ctx *ctx,
 			  struct wrapfd_load __user *user_wrapfd_load)
 {
 	struct wrapfd_load wrapfd_load;
+	struct wrap_content *content;
 	struct file *file;
+	loff_t file_offs;
+	loff_t buf_offs;
+	loff_t len;
 	loff_t end;
 	int ret = 0;
 
@@ -670,10 +1215,11 @@ static int wrap_file_load(struct wrap_ctx *ctx,
 			   sizeof(wrapfd_load)))
 		return -EFAULT;
 
-	if (!PAGE_ALIGNED(wrapfd_load.file_offs))
-		return -EINVAL;
+	file_offs = wrapfd_load.file_offs;
+	buf_offs = wrapfd_load.buf_offs;
+	len = wrapfd_load.len;
 
-	if (!PAGE_ALIGNED(wrapfd_load.buf_offs))
+	if (file_offs < 0 || buf_offs < 0 || len < 0)
 		return -EINVAL;
 
 	if (wrapfd_load.reserved || wrapfd_load.pad)
@@ -703,11 +1249,7 @@ static int wrap_file_load(struct wrap_ctx *ctx,
 		goto put_file;
 	}
 
-	/* Align the size to the page boundary */
-	wrapfd_load.len = PAGE_ALIGN(wrapfd_load.len);
-
-	if (check_add_overflow(wrapfd_load.file_offs, wrapfd_load.len,
-			       &end)) {
+	if (check_add_overflow(file_offs, len, &end)) {
 		ret = -EINVAL;
 		goto put_file;
 	}
@@ -718,18 +1260,27 @@ static int wrap_file_load(struct wrap_ctx *ctx,
 	}
 
 	spin_lock(&ctx->lock);
-	ret = block_operations(ctx, OP_BLOCKED_MODIFICATION);
+	ret = context_use(ctx) ? 0 : -ENOENT;
 	spin_unlock(&ctx->lock);
 
 	if (ret)
 		goto put_file;
 
-	ret = ctx->content->ops->load(ctx->content, file,
-				      wrapfd_load.file_offs,
-				      wrapfd_load.buf_offs,
-				      wrapfd_load.len);
+	content = ctx->content;
+	if (!content) {
+		ret = -ENOENT;
+		goto put_ctx;
+	}
+
+	if (content->ops->is_writable && !content->ops->is_writable(content)) {
+		ret = -EACCES;
+		goto put_ctx;
+	}
+
+	ret = content->ops->load(content, file, file_offs, buf_offs, len);
+put_ctx:
 	spin_lock(&ctx->lock);
-	unblock_operations(ctx);
+	context_unuse(ctx);
 	spin_unlock(&ctx->lock);
 put_file:
 	fput(file);
@@ -757,8 +1308,7 @@ static int wrap_file_rewrap(struct wrap_ctx *ctx,
 		return -EINVAL;
 
 	spin_lock(&ctx->lock);
-	ret = block_operations(ctx,
-			       OP_BLOCKED_MODIFICATION | OP_BLOCKED_MAPPING);
+	ret = block_usage(ctx);
 	if (!ret) {
 		content = ctx->content;
 		ctx->content = NULL;
@@ -770,8 +1320,8 @@ static int wrap_file_rewrap(struct wrap_ctx *ctx,
 
 	new_content = content->ops->make_writable(content,
 				(wrapfd_rewrap.prot & PROT_WRITE) != 0);
-	if (!new_content) {
-		ret = -ENOMEM;
+	if (IS_ERR(new_content)) {
+		ret = PTR_ERR(new_content);
 		goto restore_content;
 	}
 	new_content->close_on_exec = content->close_on_exec;
@@ -790,7 +1340,7 @@ static int wrap_file_rewrap(struct wrap_ctx *ctx,
 		content->ops->free(content);
 
 	spin_lock(&ctx->lock);
-	unblock_operations(ctx);
+	unblock_usage(ctx);
 	spin_unlock(&ctx->lock);
 
 	return ret;
@@ -807,7 +1357,7 @@ restore_content:
 	 */
 	spin_lock(&ctx->lock);
 	ctx->content = content;
-	unblock_operations(ctx);
+	unblock_usage(ctx);
 	spin_unlock(&ctx->lock);
 out:
 	return ret;
@@ -820,14 +1370,13 @@ static int wrap_file_empty(struct wrap_ctx *ctx)
 
 	spin_lock(&ctx->lock);
 
-	ret = block_operations(ctx,
-			       OP_BLOCKED_MODIFICATION | OP_BLOCKED_MAPPING);
+	ret = block_usage(ctx);
 	if (ret)
 		goto unlock;
 
 	content = ctx->content;
 	ctx->content = NULL;
-	unblock_operations(ctx);
+	unblock_usage(ctx);
 unlock:
 	spin_unlock(&ctx->lock);
 
@@ -843,7 +1392,7 @@ static int wrap_file_allow_guests(struct wrap_ctx *ctx, bool allow)
 
 	spin_lock(&ctx->lock);
 
-	ret = can_access(ctx, current, true);
+	ret = can_modify(ctx, current, true);
 	if (ret)
 		goto unlock;
 
@@ -857,13 +1406,48 @@ unlock:
 static int wrap_file_ioctl(struct wrap_ctx *ctx,
 			   unsigned int cmd, unsigned long arg)
 {
-	if (!ctx->content)
-		return -ENOENT; /* Wrap is empty */
+	int ret = 0;
 
-	if (ctx->content->ops->ioctl)
-		return ctx->content->ops->ioctl(ctx->content, cmd, arg);
+	spin_lock(&ctx->lock);
+	if (!ctx->allow_guests && has_owner(ctx) &&
+	    !is_owner_task(ctx, current)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 
-	return -ENOIOCTLCMD;
+	/*
+	 * If usage is blocked, the content is being rewrapped or emptied.
+	 * Treat this as if the wrap is already empty.
+	 */
+	if (!context_use(ctx)) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	if (!ctx->content) {
+		context_unuse(ctx);
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	if (!ctx->content->ops->ioctl) {
+		context_unuse(ctx);
+		ret = -ENOIOCTLCMD;
+		goto unlock;
+	}
+unlock:
+	spin_unlock(&ctx->lock);
+
+	if (ret)
+		return ret;
+
+	ret = ctx->content->ops->ioctl(ctx->content, cmd, arg);
+
+	spin_lock(&ctx->lock);
+	context_unuse(ctx);
+	spin_unlock(&ctx->lock);
+
+	return ret;
 }
 
 static long wrap_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -906,14 +1490,30 @@ static long wrap_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	return ret;
 }
 
+static long wrap_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	/* These commands are associated with pointers as arguments, so use compat_ptr() on them. */
+	switch (cmd) {
+	case WRAPFD_DEV_IOC_GET_STATE:
+	case WRAPFD_DEV_IOC_LOAD:
+	case WRAPFD_DEV_IOC_REWRAP:
+		arg = (unsigned long)compat_ptr(arg);
+		break;
+	}
+
+	return wrap_ioctl(file, cmd, arg);
+}
+
 #ifdef CONFIG_PROC_FS
 static void wrap_show_fdinfo(struct seq_file *m, struct file *file)
 {
 	struct wrap_ctx *ctx = file->private_data;
+	struct task_struct *owner_task;
 
 	spin_lock(&ctx->lock);
-	if (ctx->owner.task) {
-		seq_printf(m, "owner:\t%d\n", ctx->owner.task->pid);
+	owner_task = get_valid_owner(ctx);
+	if (owner_task) {
+		seq_printf(m, "owner:\t%d\n", owner_task->pid);
 	} else {
 		if (ctx->owner.dev)
 			seq_printf(m, "owner:\t<device>\n");
@@ -936,7 +1536,7 @@ static void wrap_show_fdinfo(struct seq_file *m, struct file *file)
 
 bool is_wrapfd_vma(struct vm_area_struct *vma)
 {
-	return (vma && (vma->vm_ops->open == wrap_vm_open));
+	return vma && vma->vm_ops && (vma->vm_ops->open == wrap_vm_open);
 }
 
 int wrapfd_get_mappable(struct file *file, struct device *dev,
@@ -955,12 +1555,12 @@ int wrapfd_get_mappable(struct file *file, struct device *dev,
 
 	spin_lock(&ctx->lock);
 
-	if (is_owner(ctx) && !is_owner_dev(ctx, dev)) {
+	if (has_owner(ctx) && !is_owner_dev(ctx, dev)) {
 		ret = -EBUSY;
 		goto unlock;
 	}
 
-	if (ctx->map_count > 0) {
+	if (ctx->map_count > 0 || ctx->use_count > 0) {
 		ret = -EINVAL;
 		goto unlock;
 	}
@@ -988,6 +1588,7 @@ unlock:
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(wrapfd_get_mappable);
 
 int wrapfd_put_mappable(struct file *file, struct device *dev,
 			union wrapfd_mappable *mappable)
@@ -1020,13 +1621,15 @@ unlock:
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(wrapfd_put_mappable);
 
 static const struct file_operations wrap_fops = {
 	.owner		= THIS_MODULE,
+	.llseek		= wrap_llseek,
 	.mmap		= wrap_mmap,
 	.release	= wrap_release,
 	.unlocked_ioctl	= wrap_ioctl,
-	.compat_ioctl	= wrap_ioctl,
+	.compat_ioctl	= wrap_compat_ioctl,
 #ifdef CONFIG_PROC_FS
 	.show_fdinfo	= wrap_show_fdinfo,
 #endif
@@ -1034,20 +1637,23 @@ static const struct file_operations wrap_fops = {
 
 static struct wrap_content *create_content_for(int fd, unsigned long prot)
 {
+	bool is_file_writable, writable;
 	struct wrap_content *content;
 	struct dma_buf *dmabuf;
 
 	dmabuf = dma_buf_get(fd);
-	if (!IS_ERR(dmabuf)) {
-		bool writable = !!(prot & PROT_WRITE);
+	if (IS_ERR(dmabuf))
+		return ERR_PTR(PTR_ERR(dmabuf));
 
+	writable = !!(prot & PROT_WRITE);
+	is_file_writable = !!(dmabuf->file->f_mode & FMODE_WRITE);
+	if (writable && !is_file_writable)
+		content = ERR_PTR(-EACCES);
+	else
 		content = alloc_dmabuf_content(dmabuf, writable);
-		dma_buf_put(dmabuf);
+	dma_buf_put(dmabuf);
 
-		return content ? content : ERR_PTR(-ENOMEM);
-	}
-
-	return ERR_PTR(-EINVAL);
+	return content;
 }
 
 static int wrap_file(struct wrap_ctx *ctx,
@@ -1110,7 +1716,7 @@ static long wrapfd_dev_ioctl(struct file *file, unsigned int cmd,
 static const struct file_operations wrapfd_dev_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = wrapfd_dev_ioctl,
-	.compat_ioctl = wrapfd_dev_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 	.llseek = noop_llseek,
 };
 

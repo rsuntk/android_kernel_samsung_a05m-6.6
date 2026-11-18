@@ -173,7 +173,7 @@ static int alloc_discontig_frames(unsigned int order)
  * looking at another vcpu's cr3 value, it should use this variable.
  */
 DEFINE_PER_CPU(unsigned long, xen_cr3);	 /* cr3 stored as physaddr */
-DEFINE_PER_CPU(unsigned long, xen_current_cr3);	 /* actual vcpu cr3 */
+static DEFINE_PER_CPU(unsigned long, xen_current_cr3);	/* actual vcpu cr3 */
 
 static phys_addr_t xen_pt_base, xen_pt_size __initdata;
 
@@ -350,16 +350,17 @@ static void xen_set_pte(pte_t *ptep, pte_t pteval)
 	__xen_set_pte(ptep, pteval);
 }
 
-pte_t xen_ptep_modify_prot_start(struct vm_area_struct *vma,
-				 unsigned long addr, pte_t *ptep)
+static pte_t xen_ptep_modify_prot_start(struct vm_area_struct *vma,
+					unsigned long addr, pte_t *ptep)
 {
 	/* Just return the pte as-is.  We preserve the bits on commit */
 	trace_xen_mmu_ptep_modify_prot_start(vma->vm_mm, addr, ptep, *ptep);
 	return *ptep;
 }
 
-void xen_ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr,
-				 pte_t *ptep, pte_t pte)
+static void xen_ptep_modify_prot_commit(struct vm_area_struct *vma,
+					unsigned long addr,
+					pte_t *ptep, pte_t pte)
 {
 	struct mmu_update u;
 
@@ -1111,7 +1112,7 @@ static void __init xen_cleanmfnmap_pmd(pmd_t *pmd, bool unpin)
 	pte_t *pte_tbl;
 	int i;
 
-	if (pmd_large(*pmd)) {
+	if (pmd_leaf(*pmd)) {
 		pa = pmd_val(*pmd) & PHYSICAL_PAGE_MASK;
 		xen_free_ro_pages(pa, PMD_SIZE);
 		return;
@@ -1923,7 +1924,7 @@ static phys_addr_t __init xen_early_virt_to_phys(unsigned long vaddr)
 	if (!pmd_present(pmd))
 		return 0;
 	pa = pmd_val(pmd) & PTE_PFN_MASK;
-	if (pmd_large(pmd))
+	if (pmd_leaf(pmd))
 		return pa + (vaddr & ~PMD_MASK);
 
 	pte = native_make_pte(xen_read_phys_ulong(pa + pte_index(vaddr) *

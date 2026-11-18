@@ -198,6 +198,7 @@ static struct btrfs_ordered_extent *alloc_ordered_extent(
 	INIT_LIST_HEAD(&entry->log_list);
 	INIT_LIST_HEAD(&entry->root_extent_list);
 	INIT_LIST_HEAD(&entry->work_list);
+	INIT_LIST_HEAD(&entry->bioc_list);
 	init_completion(&entry->completion);
 
 	/*
@@ -300,6 +301,18 @@ void btrfs_add_ordered_sum(struct btrfs_ordered_extent *entry,
 	spin_lock_irq(&tree->lock);
 	list_add_tail(&sum->list, &entry->list);
 	spin_unlock_irq(&tree->lock);
+}
+
+void btrfs_mark_ordered_extent_truncated(struct btrfs_ordered_extent *ordered,
+					 u64 truncate_len)
+{
+	struct btrfs_inode *inode = BTRFS_I(ordered->inode);
+
+	ASSERT(truncate_len <= ordered->num_bytes);
+	spin_lock_irq(&inode->ordered_tree.lock);
+	set_bit(BTRFS_ORDERED_TRUNCATED, &ordered->flags);
+	ordered->truncated_len = min(ordered->truncated_len, truncate_len);
+	spin_unlock_irq(&inode->ordered_tree.lock);
 }
 
 static void finish_ordered_fn(struct btrfs_work *work)

@@ -17,6 +17,7 @@
 #include <linux/printk.h>
 #include <linux/seq_file.h>
 #include <linux/mm.h>
+#include <linux/printk.h>
 #include <linux/sched.h>
 
 #define pgmigration_err(fmt, ...) \

@@ -20,6 +20,7 @@
 #include <linux/mmc/card.h>
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/sd.h>
+#include <trace/hooks/mmc.h>
 
 #include "core.h"
 #include "card.h"
@@ -1922,6 +1923,7 @@ err:
 
 	if (err)
 		host->unused = 1;
+	trace_android_vh_mmc_attach_sd(host, err);
 
 	return err;
 }

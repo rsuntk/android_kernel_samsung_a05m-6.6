@@ -1550,31 +1550,10 @@ transparent_hugepage_adjust(struct kvm *kvm, struct kvm_memory_slot *memslot,
 	return PAGE_SIZE;
 }
 
-static int get_vma_page_shift(struct vm_area_struct *vma, unsigned long hva)
+static int get_vma_page_shift(struct vm_area_struct *vma)
 {
-	unsigned long pa;
-
 	if (is_vm_hugetlb_page(vma) && !(vma->vm_flags & VM_PFNMAP))
 		return huge_page_shift(hstate_vma(vma));
-
-	if (!(vma->vm_flags & VM_PFNMAP))
-		return PAGE_SHIFT;
-
-	VM_BUG_ON(is_vm_hugetlb_page(vma));
-
-	pa = (vma->vm_pgoff << PAGE_SHIFT) + (hva - vma->vm_start);
-
-#ifndef __PAGETABLE_PMD_FOLDED
-	if ((hva & (PUD_SIZE - 1)) == (pa & (PUD_SIZE - 1)) &&
-	    ALIGN_DOWN(hva, PUD_SIZE) >= vma->vm_start &&
-	    ALIGN(hva, PUD_SIZE) <= vma->vm_end)
-		return PUD_SHIFT;
-#endif
-
-	if ((hva & (PMD_SIZE - 1)) == (pa & (PMD_SIZE - 1)) &&
-	    ALIGN_DOWN(hva, PMD_SIZE) >= vma->vm_start &&
-	    ALIGN(hva, PMD_SIZE) <= vma->vm_end)
-		return PMD_SHIFT;
 
 	return PAGE_SHIFT;
 }
@@ -1686,7 +1665,7 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 {
 	unsigned int flags = FOLL_HWPOISON | FOLL_LONGTERM | FOLL_WRITE;
 	struct kvm_hyp_memcache *hyp_memcache = &vcpu->arch.stage2_mc;
-	unsigned long page_size = PAGE_SIZE;
+	long page_size = PAGE_SIZE;
 	struct mm_struct *mm = current->mm;
 	struct kvm_pinned_page *ppage;
 	struct kvm *kvm = vcpu->kvm;
@@ -1709,14 +1688,15 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 
 	mmap_read_lock(mm);
 	ret = pin_user_pages(hva, 1, flags, &page);
-	mmap_read_unlock(mm);
 
 	if (ret == -EHWPOISON) {
 		kvm_send_hwpoison_signal(hva, PAGE_SHIFT);
 		ret = 0;
+		mmap_read_unlock(mm);
 		goto free_ppage;
 	} else if (ret != 1) {
 		ret = -EFAULT;
+		mmap_read_unlock(mm);
 		goto free_ppage;
 	} else if (kvm->arch.pkvm.enabled && !PageSwapBacked(page)) {
 		/*
@@ -1734,10 +1714,12 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 		 * prevent try_to_unmap() from succeeding.
 		 */
 		ret = -EIO;
+		mmap_read_unlock(mm);
 		goto unpin;
 	}
 
 	pfn = page_to_pfn(page);
+	*fault_ipa = ALIGN_DOWN(*fault_ipa, PAGE_SIZE);
 
 	read_lock(&kvm->mmu_lock);
 	if (!kvm_pinned_pages_iter_first(&vcpu->kvm->arch.pkvm.pinned_pages,
@@ -1750,6 +1732,13 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t *fault_ipa,
 	 * host_map_guest HVC
 	 */
 	read_unlock(&kvm->mmu_lock);
+	mmap_read_unlock(mm);
+
+	/* Stage-1 mapping missing. Retry the fault. */
+	if (page_size < 0) {
+		ret = page_size == -EAGAIN ? 0 : page_size;
+		goto unpin;
+	}
 
 	page = pfn_to_page(pfn);
 
@@ -1865,9 +1854,8 @@ static int __pkvm_pin_user_pages(struct kvm *kvm, struct kvm_memory_slot *memslo
 	if (!pages)
 		return -ENOMEM;
 
-	mmap_read_lock(mm);
+	mmap_assert_locked(mm);
 	ret = pin_user_pages(hva, nr_pages, flags, pages);
-	mmap_read_unlock(mm);
 
 	if (ret == -EHWPOISON) {
 		kvm_send_hwpoison_signal(hva, PAGE_SHIFT);
@@ -1947,7 +1935,9 @@ int __pkvm_pgtable_stage2_split(struct kvm_vcpu *vcpu, phys_addr_t ipa, size_t s
 
 	idx = srcu_read_lock(&vcpu->kvm->srcu);
 	memslot = gfn_to_memslot(vcpu->kvm, gfn);
+	mmap_read_lock(current->mm);
 	ret = __pkvm_pin_user_pages(kvm, memslot, gfn, nr_pages, &pages);
+	mmap_read_unlock(current->mm);
 	if (ret)
 		goto unlock_srcu;
 
@@ -1960,6 +1950,17 @@ int __pkvm_pgtable_stage2_split(struct kvm_vcpu *vcpu, phys_addr_t ipa, size_t s
 	} else if (!ppage->order) {
 		ret = 0;
 		goto end;
+	}
+
+	/*
+	 * Ensure userspace has not remapped the HVA since the huge page was
+	 * donated; every newly pinned page's PFN (HPA) must match ppage.
+	 */
+	for (p = 0; p < nr_pages; p++) {
+		if (page_to_pfn(pages[p]) != page_to_pfn(ppage->page) + 1 + p) {
+			ret = -EFAULT;
+			goto end;
+		}
 	}
 
 	ret = kvm_call_hyp_nvhe(__pkvm_host_split_guest, page_to_pfn(ppage->page),
@@ -2072,7 +2073,7 @@ static int user_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa,
 		force_pte = true;
 		vma_shift = PAGE_SHIFT;
 	} else {
-		vma_shift = get_vma_page_shift(vma, hva);
+		vma_shift = get_vma_page_shift(vma);
 	}
 
 	switch (vma_shift) {

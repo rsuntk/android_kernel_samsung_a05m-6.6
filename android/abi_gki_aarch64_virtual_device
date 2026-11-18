@@ -1149,6 +1149,7 @@
   drm_dev_printk
   drm_dev_unplug
   drm_do_get_edid
+  drm_event_cancel_free
   drm_event_reserve_init
   drm_framebuffer_init
   drm_gem_dmabuf_mmap
@@ -1211,6 +1212,7 @@
   __tracepoint_dma_fence_emit
   video_firmware_drivers_only
   vmemdup_user
+  ww_mutex_lock
   ww_mutex_lock_interruptible
   ww_mutex_unlock
 
@@ -1235,6 +1237,8 @@
   device_register
   memparse
   register_virtio_device
+  __root_device_register
+  root_device_unregister
   synchronize_irq
   __traceiter_rwmmio_post_read
   __traceiter_rwmmio_post_write

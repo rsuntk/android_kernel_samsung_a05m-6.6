@@ -1648,6 +1648,11 @@ bool cpu_busy_with_softirqs(int cpu)
 	return softirqs & LONG_SOFTIRQ_MASK;
 }
 EXPORT_SYMBOL_GPL(cpu_busy_with_softirqs);
+
+bool local_rt_runnable(void)
+{
+	return sched_rt_runnable(this_rq());
+}
 #endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
 
 static bool rt_task_fits_cpu(struct task_struct *p, int cpu)
@@ -2324,6 +2329,7 @@ static void push_rt_tasks(struct rq *rq)
  */
 static int rto_next_cpu(struct root_domain *rd)
 {
+	int this_cpu = smp_processor_id();
 	int next;
 	int cpu;
 
@@ -2349,6 +2355,10 @@ static int rto_next_cpu(struct root_domain *rd)
 		trace_android_rvh_rto_next_cpu(rd->rto_cpu, rd->rto_mask, &cpu);
 
 		rd->rto_cpu = cpu;
+
+		/* Do not send IPI to self */
+		if (cpu == this_cpu)
+			continue;
 
 		if (cpu < nr_cpu_ids)
 			return cpu;
@@ -2880,7 +2890,7 @@ static int tg_rt_schedulable(struct task_group *tg, void *data)
 {
 	struct rt_schedulable_data *d = data;
 	struct task_group *child;
-	unsigned long total, sum = 0;
+	u64 total, sum = 0;
 	u64 period, runtime;
 
 	period = ktime_to_ns(tg->rt_bandwidth.rt_period);

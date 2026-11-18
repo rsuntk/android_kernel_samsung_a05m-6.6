@@ -2495,6 +2495,7 @@ static void cgroup_migrate_add_task(struct task_struct *task,
 
 	mgctx->tset.nr_tasks++;
 
+	css_set_skip_task_iters(cset, task);
 	list_move_tail(&task->cg_list, &cset->mg_tasks);
 	if (list_empty(&cset->mg_node))
 		list_add_tail(&cset->mg_node,
@@ -3841,33 +3842,41 @@ static int cgroup_cpu_pressure_show(struct seq_file *seq, void *v)
 static ssize_t pressure_write(struct kernfs_open_file *of, char *buf,
 			      size_t nbytes, enum psi_res res)
 {
-	struct cgroup_file_ctx *ctx = of->priv;
+	struct cgroup_file_ctx *ctx;
 	struct psi_trigger *new;
 	struct cgroup *cgrp;
 	struct psi_group *psi;
+	ssize_t ret = 0;
 
 	cgrp = cgroup_kn_lock_live(of->kn, false);
 	if (!cgrp)
 		return -ENODEV;
 
-	cgroup_get(cgrp);
-	cgroup_kn_unlock(of->kn);
+	ctx = of->priv;
+	if (!ctx) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
 
 	/* Allow only one trigger per file descriptor */
 	if (ctx->psi.trigger) {
-		cgroup_put(cgrp);
-		return -EBUSY;
+		ret = -EBUSY;
+		goto out_unlock;
 	}
 
 	psi = cgroup_psi(cgrp);
 	new = psi_trigger_create(psi, buf, res, of->file, of);
 	if (IS_ERR(new)) {
-		cgroup_put(cgrp);
-		return PTR_ERR(new);
+		ret = PTR_ERR(new);
+		goto out_unlock;
 	}
 
 	smp_store_release(&ctx->psi.trigger, new);
-	cgroup_put(cgrp);
+
+out_unlock:
+	cgroup_kn_unlock(of->kn);
+	if (ret)
+		return ret;
 
 	return nbytes;
 }
@@ -5478,6 +5487,7 @@ static void css_free_rwork_fn(struct work_struct *work)
 			kernfs_put(cgrp->kn);
 			psi_cgroup_free(cgrp);
 			cgroup_rstat_exit(cgrp);
+			kfree(cgrp->kmi_ext_info);
 			kfree(cgrp);
 		} else {
 			/*
@@ -5720,15 +5730,17 @@ static struct cgroup *cgroup_create(struct cgroup *parent, const char *name,
 	if (ret)
 		goto out_kernfs_remove;
 
+	cgrp->kmi_ext_info = kzalloc(sizeof(*cgrp->kmi_ext_info), GFP_KERNEL);
+	if (!cgrp->kmi_ext_info) {
+		ret = -ENOMEM;
+		goto out_psi_free;
+	}
+
 	if (cgrp->root == &cgrp_dfl_root) {
 		ret = cgroup_bpf_inherit(cgrp);
 		if (ret)
-			goto out_psi_free;
+			goto out_kmi_ext_free;
 	}
-
-	cgrp->kmi_ext_info = kzalloc(sizeof(*cgrp->kmi_ext_info), GFP_KERNEL);
-	if (!cgrp->kmi_ext_info)
-		goto out_psi_free;
 
 	/*
 	 * New cgroup inherits effective freeze counter, and
@@ -5790,6 +5802,8 @@ static struct cgroup *cgroup_create(struct cgroup *parent, const char *name,
 
 	return cgrp;
 
+out_kmi_ext_free:
+	kfree(cgrp->kmi_ext_info);
 out_psi_free:
 	psi_cgroup_free(cgrp);
 out_kernfs_remove:
@@ -6020,7 +6034,6 @@ static int cgroup_destroy_locked(struct cgroup *cgrp)
 	spin_lock_irq(&css_set_lock);
 	list_for_each_entry(link, &cgrp->cset_links, cset_link)
 		link->cset->dead = true;
-	kfree(cgrp->kmi_ext_info);
 	spin_unlock_irq(&css_set_lock);
 
 	/* initiate massacre of all css's */

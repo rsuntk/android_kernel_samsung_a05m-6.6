@@ -1014,6 +1014,7 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 				return ret;
 			}
 		}
+		trace_android_vh_filemap_adjust_folio_flags(mapping, folio, index);
 		folio_add_lru(folio);
 	}
 	return ret;
@@ -1699,6 +1700,7 @@ void folio_end_writeback(struct folio *folio)
 		BUG();
 
 	smp_mb__after_atomic();
+	trace_android_vh_folio_end_writeback(folio);
 	folio_wake(folio, PG_writeback);
 	acct_reclaim_writeback(folio);
 	folio_put(folio);
@@ -2768,15 +2770,6 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 		end_offset = min_t(loff_t, isize, iocb->ki_pos + iter->count);
 
 		/*
-		 * Pairs with a barrier in
-		 * block_write_end()->mark_buffer_dirty() or other page
-		 * dirtying routines like iomap_write_end() to ensure
-		 * changes to page contents are visible before we see
-		 * increased inode size.
-		 */
-		smp_rmb();
-
-		/*
 		 * Once we start copying data, we don't want to be touching any
 		 * cachelines that might be contended:
 		 */
@@ -3324,6 +3317,7 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	trace_android_vh_tune_mmap_readaround(ra->ra_pages, vmf->pgoff,
 			&ra->start, &ra->size, &ra->async_size);
 	ractl._index = ra->start;
+	trace_android_vh_page_cache_read(file->f_inode, ra->start, ra->size);
 	trace_android_vh_page_cache_readahead_start(file, vmf->pgoff,
 			ra->size, true);
 	page_cache_ra_order(&ractl, ra, 0);
@@ -3718,15 +3712,20 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	pgoff_t orig_start_pgoff = start_pgoff;
 	bool can_map_large;
 
+	/*
+	 * Recalculate end_pgoff based on file_end before calling
+	 * next_uptodate_folio() to avoid races with concurrent
+	 * truncation.
+	 */
+	file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE) - 1;
+	end_pgoff = min(end_pgoff, file_end);
+
 	rcu_read_lock();
 	folio = next_uptodate_folio(&xas, mapping, end_pgoff);
 	if (!folio)
 		goto out;
 	first_pgoff = xas.xa_index;
 	orig_start_pgoff = xas.xa_index;
-
-	file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE) - 1;
-	end_pgoff = min(end_pgoff, file_end);
 
 	/*
 	 * Do not allow to map with PTEs beyond i_size and with PMD
@@ -3868,6 +3867,7 @@ static struct folio *do_read_cache_folio(struct address_space *mapping,
 	struct folio *folio;
 	int err;
 
+	trace_android_vh_page_cache_read(mapping->host, index, 1);
 	if (!filler)
 		filler = mapping->a_ops->read_folio;
 repeat:
@@ -4429,7 +4429,7 @@ static inline bool can_do_cachestat(struct file *f)
 {
 	if (f->f_mode & FMODE_WRITE)
 		return true;
-	if (inode_owner_or_capable(file_mnt_idmap(f), file_inode(f)))
+	if (file_owner_or_capable(f))
 		return true;
 	return file_permission(f, MAY_WRITE) == 0;
 }

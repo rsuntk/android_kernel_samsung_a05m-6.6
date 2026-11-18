@@ -613,7 +613,7 @@ static int queue_folios_hugetlb(pte_t *pte, unsigned long hmask,
 	if (flags & (MPOL_MF_MOVE_ALL) ||
 	    (flags & MPOL_MF_MOVE && !folio_likely_mapped_shared(folio) &&
 	     !hugetlb_pmd_shared(pte))) {
-		if (!isolate_hugetlb(folio, qp->pagelist) &&
+		if (!folio_isolate_hugetlb(folio, qp->pagelist) &&
 			(flags & MPOL_MF_STRICT))
 			/*
 			 * Failed to isolate folio but allow migrating pages
@@ -1088,10 +1088,9 @@ static int migrate_to_node(struct mm_struct *mm, int source, int dest,
 	 */
 	vma = find_vma(mm, 0);
 	VM_BUG_ON(!(flags & (MPOL_MF_MOVE | MPOL_MF_MOVE_ALL)));
-	if (unlikely(!vma)) {
-		mmap_read_unlock(mm);
+	if (unlikely(!vma))
 		return 0;
-	}
+
 	queue_pages_range(mm, vma->vm_start, mm->task_size, &nmask,
 			flags | MPOL_MF_DISCONTIG_OK, &pagelist, false);
 

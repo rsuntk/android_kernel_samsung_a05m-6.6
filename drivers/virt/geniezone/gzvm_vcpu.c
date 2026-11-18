@@ -133,17 +133,20 @@ static long gzvm_vcpu_run(struct gzvm_vcpu *vcpu, void __user *argp)
 {
 	bool need_userspace = false;
 	u64 exit_reason;
+	struct gzvm_vcpu_run run;
 
-	if (copy_from_user(vcpu->run, argp, sizeof(struct gzvm_vcpu_run)))
+	if (copy_from_user(&run, argp, sizeof(run)))
 		return -EFAULT;
 
-	for (int i = 0; i < ARRAY_SIZE(vcpu->run->padding1); i++) {
-		if (vcpu->run->padding1[i])
+	for (int i = 0; i < ARRAY_SIZE(run.padding1); i++) {
+		if (run.padding1[i])
 			return -EINVAL;
 	}
 
-	if (vcpu->run->immediate_exit == 1)
+	if (run.immediate_exit == 1)
 		return -EINTR;
+
+	memcpy(vcpu->run, &run, sizeof(run));
 
 	while (!need_userspace && !signal_pending(current)) {
 		gzvm_arch_vcpu_run(vcpu, &exit_reason);
@@ -213,6 +216,16 @@ static long gzvm_vcpu_ioctl(struct file *filp, unsigned int ioctl,
 	void __user *argp = (void __user *)arg;
 	struct gzvm_vcpu *vcpu = filp->private_data;
 
+	/*
+	 * Reject ioctls issued by a process other than the VM creator
+	 * (cf. KVM's kvm->mm check).
+	 */
+	if (vcpu->gzvm->mm != current->mm)
+		return -EIO;
+
+	if (mutex_lock_killable(&vcpu->lock))
+		return -EINTR;
+
 	switch (ioctl) {
 	case GZVM_RUN:
 		ret = gzvm_vcpu_run(vcpu, argp);
@@ -229,6 +242,7 @@ static long gzvm_vcpu_ioctl(struct file *filp, unsigned int ioctl,
 		break;
 	}
 
+	mutex_unlock(&vcpu->lock);
 	return ret;
 }
 
@@ -297,8 +311,6 @@ int gzvm_vm_ioctl_create_vcpu(struct gzvm *gzvm, u32 cpuid)
 	struct gzvm_vcpu *vcpu;
 	int ret;
 
-	gzvm_vm_get(gzvm);
-
 	if (cpuid >= GZVM_MAX_VCPUS)
 		return -EINVAL;
 
@@ -323,20 +335,33 @@ int gzvm_vm_ioctl_create_vcpu(struct gzvm *gzvm, u32 cpuid)
 	vcpu->vcpuid = cpuid;
 	vcpu->gzvm = gzvm;
 	mutex_init(&vcpu->lock);
+	gzvm_vtimer_init(vcpu);
+
+	mutex_lock(&gzvm->lock);
+	if (gzvm->vcpus[cpuid]) {
+		ret = -EEXIST;
+		goto free_vcpu_run;
+	}
 
 	ret = gzvm_arch_create_vcpu(gzvm->vm_id, vcpu->vcpuid, vcpu->run);
 	if (ret < 0)
 		goto free_vcpu_run;
 
+	gzvm_vm_get(gzvm);
+
 	ret = create_vcpu_fd(vcpu);
 	if (ret < 0)
-		goto free_vcpu_run;
+		goto put_vm;
 	gzvm->vcpus[cpuid] = vcpu;
+	mutex_unlock(&gzvm->lock);
 
-	gzvm_vtimer_init(vcpu);
 	return ret;
 
+put_vm:
+	gzvm_vm_put(gzvm);
+	gzvm_arch_destroy_vcpu(gzvm->vm_id, vcpu->vcpuid);
 free_vcpu_run:
+	mutex_unlock(&gzvm->lock);
 	free_pages_exact(vcpu->run, GZVM_VCPU_RUN_MAP_SIZE);
 free_vcpu:
 	kfree(vcpu);

@@ -840,6 +840,9 @@ static int fuse_try_move_page(struct fuse_copy_state *cs, struct page **pagep)
 
 	folio_clear_mappedtodisk(newfolio);
 
+	if (folio_test_large(newfolio))
+		goto out_fallback_unlock;
+
 	if (fuse_check_folio(newfolio) != 0)
 		goto out_fallback_unlock;
 
@@ -857,6 +860,10 @@ static int fuse_try_move_page(struct fuse_copy_state *cs, struct page **pagep)
 	if (WARN_ON(folio_test_mlocked(oldfolio)))
 		goto out_fallback_unlock;
 
+	err = lock_request(cs->req);
+	if (err)
+		goto out_fallback_unlock;
+
 	replace_page_cache_folio(oldfolio, newfolio);
 
 	folio_get(newfolio);
@@ -870,20 +877,7 @@ static int fuse_try_move_page(struct fuse_copy_state *cs, struct page **pagep)
 	 */
 	pipe_buf_release(cs->pipe, buf);
 
-	err = 0;
-	spin_lock(&cs->req->waitq.lock);
-	if (test_bit(FR_ABORTED, &cs->req->flags))
-		err = -ENOENT;
-	else
-		*pagep = &newfolio->page;
-	spin_unlock(&cs->req->waitq.lock);
-
-	if (err) {
-		folio_unlock(newfolio);
-		folio_put(newfolio);
-		goto out_put_old;
-	}
-
+	*pagep = &newfolio->page;
 	folio_unlock(oldfolio);
 	/* Drop ref for ap->pages[] array */
 	folio_put(oldfolio);
@@ -935,7 +929,7 @@ static int fuse_ref_page(struct fuse_copy_state *cs, struct page *page,
 	cs->nr_segs++;
 	cs->len = 0;
 
-	return 0;
+	return lock_request(cs->req);
 }
 
 /*
@@ -997,17 +991,41 @@ static int fuse_copy_pages(struct fuse_copy_state *cs, unsigned nbytes,
 	struct fuse_req *req = cs->req;
 	struct fuse_args_pages *ap = container_of(req->args, typeof(*ap), args);
 
+	if (ap->uses_folios) {
+		for (i = 0; i < ap->num_folios && (nbytes || zeroing); i++) {
+			int err;
+			unsigned int offset = ap->folio_descs[i].offset;
+			unsigned int count = min(nbytes, ap->folio_descs[i].length);
+			struct page *orig, *pagep;
 
-	for (i = 0; i < ap->num_pages && (nbytes || zeroing); i++) {
-		int err;
-		unsigned int offset = ap->descs[i].offset;
-		unsigned int count = min(nbytes, ap->descs[i].length);
+			orig = pagep = &ap->folios[i]->page;
 
-		err = fuse_copy_page(cs, &ap->pages[i], offset, count, zeroing);
-		if (err)
-			return err;
+			err = fuse_copy_page(cs, &pagep, offset, count, zeroing);
+			if (err)
+				return err;
 
-		nbytes -= count;
+			nbytes -= count;
+
+			/*
+			 *  fuse_copy_page may have moved a page from a pipe
+			 *  instead of copying into our given page, so update
+			 *  the folios if it was replaced.
+			 */
+			if (pagep != orig)
+				ap->folios[i] = page_folio(pagep);
+		}
+	} else {
+		for (i = 0; i < ap->num_pages && (nbytes || zeroing); i++) {
+			int err;
+			unsigned int offset = ap->descs[i].offset;
+			unsigned int count = min(nbytes, ap->descs[i].length);
+
+			err = fuse_copy_page(cs, &ap->pages[i], offset, count, zeroing);
+			if (err)
+				return err;
+
+			nbytes -= count;
+		}
 	}
 	return 0;
 }
@@ -1615,6 +1633,10 @@ static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
 	inode = fuse_ilookup(fc, nodeid,  NULL);
 	if (!inode)
 		goto out_up_killsb;
+	if (!S_ISREG(inode->i_mode)) {
+		err = -EINVAL;
+		goto out_iput;
+	}
 
 	mapping = inode->i_mapping;
 	index = outarg.offset >> PAGE_SHIFT;
@@ -1736,6 +1758,10 @@ static int fuse_retrieve(struct fuse_mount *fm, struct inode *inode,
 		page = find_get_page(mapping, index);
 		if (!page)
 			break;
+		if (!PageUptodate(page)) {
+			put_page(page);
+			break;
+		}
 
 		this_num = min_t(unsigned, num, PAGE_SIZE - offset);
 		ap->pages[ap->num_pages] = page;
@@ -1786,7 +1812,10 @@ static int fuse_notify_retrieve(struct fuse_conn *fc, unsigned int size,
 
 	inode = fuse_ilookup(fc, nodeid, &fm);
 	if (inode) {
-		err = fuse_retrieve(fm, inode, &outarg);
+		if (!S_ISREG(inode->i_mode))
+			err = -EINVAL;
+		else
+			err = fuse_retrieve(fm, inode, &outarg);
 		iput(inode);
 	}
 	up_read(&fc->killsb);
@@ -1951,9 +1980,14 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	if (!err && req->in.h.opcode == FUSE_CANONICAL_PATH && !oh.error) {
 		char *path = (char *)req->args->out_args[0].value;
 
-		path[req->args->out_args[0].size - 1] = 0;
-		req->out.h.error =
-			kern_path(path, 0, req->args->canonical_path);
+		if (req->args->out_args[0].size == 0) {
+			req->out.h.error = -EBADMSG;
+		} else {
+			/* NUL-terminate inside the page; size<=PATH_MAX by construction */
+			path[min_t(unsigned int, req->args->out_args[0].size, PATH_MAX) - 1] = 0;
+			req->out.h.error =
+				kern_path(path, 0, req->args->canonical_path);
+		}
 	}
 
 	if (!err && (req->in.h.opcode == FUSE_LOOKUP ||
@@ -1963,8 +1997,19 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 				req->args->out_args[1].value;
 		struct fuse_entry_bpf *feb = container_of(febo, struct fuse_entry_bpf, out);
 
-		if (febo->backing_action == FUSE_ACTION_REPLACE)
-			feb->backing_file = fget(febo->backing_fd);
+		if (febo->backing_action == FUSE_ACTION_REPLACE) {
+			struct file *bf = fget(febo->backing_fd);
+
+			if (bf) {
+				if (bf->f_inode->i_sb->s_magic == FUSE_SUPER_MAGIC ||
+				    bf->f_inode->i_sb->s_stack_depth >=
+						FILESYSTEM_MAX_STACK_DEPTH) {
+					fput(bf);
+					bf = ERR_PTR(-ELOOP);
+				}
+			}
+			feb->backing_file = bf;
+		}
 		if (febo->bpf_action == FUSE_ACTION_REPLACE)
 			feb->bpf_file = fget(febo->bpf_fd);
 	}
