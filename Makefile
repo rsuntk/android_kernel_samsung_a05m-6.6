@@ -1932,29 +1932,6 @@ KBUILD_MODULES :=
 
 endif # CONFIG_MODULES
 
-# ---------------------------------------------------------------------------
-# MediaTek external modules
-#
-# device-modules and vendor-modules are built as external modules against this
-# tree. Use 'make mtk-modules' after building the kernel image/DTBs.
-
-PHONY += mtk-device-modules mtk-vendor-modules mtk-modules
-
-mtk-device-modules:
-	$(Q)$(MAKE) -C $(abs_srctree) O=$(abs_objtree) M=$(DEVICE_MODULES_REL_DIR) modules
-
-mtk-vendor-modules:
-	$(Q)$(MAKE) -C $(abs_srctree)/vendor-modules \
-		KERNEL_SRC=$(abs_srctree) M=vendor-modules \
-		O=$(abs_objtree) OUT_DIR=$(abs_objtree) modules
-
-mtk-modules:
-	$(Q)$(MAKE) -C $(abs_srctree) O=$(abs_objtree) modules
-	$(Q)$(MAKE) -C $(abs_srctree) O=$(abs_objtree) M=$(DEVICE_MODULES_REL_DIR) modules
-	$(Q)$(MAKE) -C $(abs_srctree)/vendor-modules \
-		KERNEL_SRC=$(abs_srctree) M=vendor-modules \
-		O=$(abs_objtree) OUT_DIR=$(abs_objtree) modules
-
 PHONY += modpost
 modpost: $(if $(single-build),, $(if $(KBUILD_MIXED_TREE),,$(if $(KBUILD_BUILTIN), vmlinux.o))) \
 	 $(if $(KBUILD_MODULES), modules_check)
