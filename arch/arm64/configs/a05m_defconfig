@@ -7954,7 +7954,7 @@ CONFIG_ARCH_USE_MEMTEST=y
 # end of Rust hacking
 # end of Kernel hacking
 
-# CONFIG_DEVICE_MODULES_ALLOW_BUILTIN is not set
+CONFIG_DEVICE_MODULES_ALLOW_BUILTIN=y
 
 #
 # Memory Management options
