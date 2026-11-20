@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: GPL-2.0
-#
-# The vendor modules are not a single kbuild unit: each module is built
-# through its own Makefile so that the per-module wrapper logic (WLAN
-# variants, hbt_driver, conninfra, ...) is preserved.
-#
-# Use the aggregate target instead:
-#
-#   make -C kernel-6.6 mtk-vendor-modules
-#
-# or:
-#
-#   make -C kernel-6.6/vendor-modules KERNEL_SRC=<kernel> \
-#        M=vendor-modules O=<out> modules
+obj-y += connectivity/common/ \
+	connectivity/conninfra/ \
+	connectivity/connfem/ \
+	connectivity/gps/gps_stp/ \
+	connectivity/gps/data_link/ \
+	connectivity/gps/gps_pwr/ \
+	connectivity/gps/gps_scp/ \
+	gpu/ \
+	connectivity/fmradio/ \
+	connectivity/wlan/adaptor/ \
+	connectivity/wlan/adaptor/wlan_page_pool/ \
+	connectivity/bt/linux_v2/ \
+	connectivity/bt/linux_v2_mt6653/ \
+	hbt_driver_cus/ \
+	mtkcam/

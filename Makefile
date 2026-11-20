@@ -5,6 +5,18 @@ SUBLEVEL = 127
 EXTRAVERSION =
 NAME = Pinguïn Aangedreven
 
+# MediaTek device and vendor modules are kept inside this kernel tree.
+# KCONFIG_EXT_PREFIX makes the top-level Kconfig source device-modules/Kconfig.ext
+# and drivers/Makefile include device-modules/Makefile.ext.
+DEVICE_MODULES_REL_DIR ?= device-modules
+KCONFIG_EXT_PREFIX ?= $(DEVICE_MODULES_REL_DIR)/
+DEVICE_MODULES_PATH ?= $(abs_srctree)/$(DEVICE_MODULES_REL_DIR)
+DEVCIE_MODULES_INCLUDE ?= -I$(DEVICE_MODULES_PATH)/include
+OUT_DIR ?= $(abs_objtree)
+
+export DEVICE_MODULES_REL_DIR KCONFIG_EXT_PREFIX
+export DEVICE_MODULES_PATH DEVCIE_MODULES_INCLUDE OUT_DIR
+
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
 # More info can be located in ./README
@@ -1919,6 +1931,29 @@ modules:
 KBUILD_MODULES :=
 
 endif # CONFIG_MODULES
+
+# ---------------------------------------------------------------------------
+# MediaTek external modules
+#
+# device-modules and vendor-modules are built as external modules against this
+# tree. Use 'make mtk-modules' after building the kernel image/DTBs.
+
+PHONY += mtk-device-modules mtk-vendor-modules mtk-modules
+
+mtk-device-modules:
+	$(Q)$(MAKE) -C $(abs_srctree) O=$(abs_objtree) M=$(DEVICE_MODULES_REL_DIR) modules
+
+mtk-vendor-modules:
+	$(Q)$(MAKE) -C $(abs_srctree)/vendor-modules \
+		KERNEL_SRC=$(abs_srctree) M=vendor-modules \
+		O=$(abs_objtree) OUT_DIR=$(abs_objtree) modules
+
+mtk-modules:
+	$(Q)$(MAKE) -C $(abs_srctree) O=$(abs_objtree) modules
+	$(Q)$(MAKE) -C $(abs_srctree) O=$(abs_objtree) M=$(DEVICE_MODULES_REL_DIR) modules
+	$(Q)$(MAKE) -C $(abs_srctree)/vendor-modules \
+		KERNEL_SRC=$(abs_srctree) M=vendor-modules \
+		O=$(abs_objtree) OUT_DIR=$(abs_objtree) modules
 
 PHONY += modpost
 modpost: $(if $(single-build),, $(if $(KBUILD_MIXED_TREE),,$(if $(KBUILD_BUILTIN), vmlinux.o))) \
