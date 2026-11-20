@@ -7436,7 +7436,7 @@ CONFIG_PKCS7_MESSAGE_PARSER=y
 #
 # Certificates for signature checking
 #
-CONFIG_MODULE_SIG_KEY="/home/dpi/qb5_8814/workspace/P4_1716/android/kernel/kernel_device_modules-6.6/certs/mtk_signing_key.pem"
+CONFIG_MODULE_SIG_KEY="device-modules/certs/mtk_signing_key.pem"
 CONFIG_MODULE_SIG_KEY_TYPE_RSA=y
 # CONFIG_MODULE_SIG_KEY_TYPE_ECDSA is not set
 CONFIG_SYSTEM_TRUSTED_KEYRING=y
