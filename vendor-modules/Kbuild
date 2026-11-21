@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
+MTK_ENV := $(if $(filter /%,$(src)),,$(srctree)/)$(src)/mtk-env.mk
+include $(MTK_ENV)
+
 obj-y += connectivity/common/ \
 	connectivity/conninfra/ \
 	connectivity/connfem/ \
