@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
+include $(srctree)/$(DEVICE_MODULES_REL_DIR)/mtk-env.mk
 
 ifeq ($(CONFIG_DEVICE_MODULES_ALLOW_BUILTIN),y)
 

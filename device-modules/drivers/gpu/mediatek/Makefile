@@ -55,13 +55,16 @@ ifneq ($(CONFIG_MTK_GPU_SUPPORT),)
     obj-y += gpu_pdma/
 
 ifneq ($(CONFIG_MTK_GPU_VERSION),"")
+MTK_PLATFORM_DIR := $(subst ",,$(CONFIG_MTK_PLATFORM))
 # GPU R5P0
 ifeq ($(CONFIG_MTK_GPU_R5P0),y)
-    obj-y += $(subst ",,$(CONFIG_MTK_PLATFORM))/
+ifneq ($(wildcard $(srctree)/$(src)/$(MTK_PLATFORM_DIR)),)
+    obj-y += $(MTK_PLATFORM_DIR)/
+endif
 else ifneq ($(word 1,$(MTK_GPU_VERSION)),)
     obj-y += gpu_$(word 1,$(MTK_GPU_VERSION))/
-else ifneq ($(CONFIG_MTK_PLATFORM),)
-    obj-y += $(subst ",,$(CONFIG_MTK_PLATFORM))/
+else ifneq ($(wildcard $(srctree)/$(src)/$(MTK_PLATFORM_DIR)),)
+    obj-y += $(MTK_PLATFORM_DIR)/
 endif
 endif
 
