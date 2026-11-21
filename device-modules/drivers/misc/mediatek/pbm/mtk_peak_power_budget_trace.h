@@ -41,6 +41,6 @@ TRACE_EVENT(peak_power_budget,
 /* This part must be outside protection */
 #undef TRACE_INCLUDE_PATH
 #undef TRACE_INCLUDE_FILE
-#define TRACE_INCLUDE_PATH ../../drivers/misc/mediatek/pbm
+#define TRACE_INCLUDE_PATH ../drivers/misc/mediatek/pbm
 #define TRACE_INCLUDE_FILE mtk_peak_power_budget_trace
 #include <trace/define_trace.h>
