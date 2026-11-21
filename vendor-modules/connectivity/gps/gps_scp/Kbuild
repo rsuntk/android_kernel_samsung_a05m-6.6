@@ -15,7 +15,7 @@ ifeq ($(DEVICE_MODULES_PATH),)
 DEVICE_MODULES_PATH = $(srctree)
 else
 LINUXINCLUDE := $(DEVCIE_MODULES_INCLUDE) $(LINUXINCLUDE)
-TOP := $(srctree)/../..
+TOP := $(srctree)
 endif
 
 $(warning GPS_CHIP_ID != common)
@@ -27,7 +27,7 @@ ifneq ($(KERNEL_OUT),)
 endif
 
 ifndef TOP
-    TOP := $(srctree)/..
+    TOP := $(srctree)
 endif
 ifeq ($(TARGET_BUILD_VARIANT),$(filter $(TARGET_BUILD_VARIANT),userdebug user))
     ldflags-y += -s

@@ -11,13 +11,13 @@ ifeq ($(DEVICE_MODULES_PATH),)
 DEVICE_MODULES_PATH = $(srctree)
 else
 LINUXINCLUDE := $(DEVCIE_MODULES_INCLUDE) $(LINUXINCLUDE)
-TOP := $(srctree)/..
+TOP := $(srctree)
 endif
 KO_PATH := $(if $(filter /%,$(src)),,$(srctree)/)$(src)
 $(info [bt_drv] btif/Kbuild KO_PATH=$(KO_PATH) DEVICE_MODULES_PATH=$(DEVICE_MODULES_PATH))
 
 ifndef TOP
-    TOP := $(srctree)/..
+    TOP := $(srctree)
 endif
 
 ifneq ($(KERNEL_OUT),)
@@ -143,9 +143,9 @@ ccflags-y += -D CONFIG_MP_WAKEUP_SOURCE_SYSFS_STAT=1
 # ---------------------------------------------------
 # Include Path
 # ---------------------------------------------------
-CONN_INFRA_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra
-CONNFEM_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/connfem
-WMT_SRC := $(TOP)/vendor/mediatek/kernel_modules/connectivity/common
+CONN_INFRA_SRC := $(TOP)/vendor-modules/connectivity/conninfra
+CONNFEM_SRC := $(TOP)/vendor-modules/connectivity/connfem
+WMT_SRC := $(TOP)/vendor-modules/connectivity/common
 BTIF_SRC := $(DEVICE_MODULES_PATH)/drivers/misc/mediatek/btif
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/connectivity/common
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/mt-plat/

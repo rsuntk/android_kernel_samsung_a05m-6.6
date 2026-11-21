@@ -5,7 +5,7 @@ ifeq ($(DEVICE_MODULES_PATH),)
 DEVICE_MODULES_PATH = $(srctree)
 else
 LINUXINCLUDE := $(DEVCIE_MODULES_INCLUDE) $(LINUXINCLUDE)
-TOP := $(srctree)/../..
+TOP := $(srctree)
 endif
 
 ifeq ($(CONFIG_MTK_GPS_SUPPORT), y)

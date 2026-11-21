@@ -13,7 +13,5 @@ obj-y += connectivity/common/ \
 	connectivity/fmradio/ \
 	connectivity/wlan/adaptor/ \
 	connectivity/wlan/adaptor/wlan_page_pool/ \
-	connectivity/bt/linux_v2/ \
-	connectivity/bt/linux_v2_mt6653/ \
 	hbt_driver_cus/ \
 	mtkcam/

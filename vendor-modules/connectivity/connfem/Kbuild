@@ -6,7 +6,7 @@ ifeq ($(DEVICE_MODULES_PATH),)
 DEVICE_MODULES_PATH = $(srctree)
 else
 LINUXINCLUDE := $(DEVCIE_MODULES_INCLUDE) $(LINUXINCLUDE)
-TOP := $(srctree)/..
+TOP := $(srctree)
 endif
 
 ifneq ($(KERNEL_OUT),)
@@ -14,7 +14,7 @@ ifneq ($(KERNEL_OUT),)
 endif
 
 ifndef TOP
-    TOP := $(srctree)/..
+    TOP := $(srctree)
 endif
 
 # Force build fail on modpost warning

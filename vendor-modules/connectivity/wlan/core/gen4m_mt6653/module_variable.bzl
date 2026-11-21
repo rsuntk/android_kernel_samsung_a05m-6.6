@@ -18,16 +18,16 @@ kernel_version = KERNEL_VERSION.split("-")[-1]
 # Name: CONNAC1 base
 # Description:
 copts_connv1 = [
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/common_main/include",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/common_main/linux/include",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/debug_utility",
+    "-I$(TOP)/vendor-modules/connectivity/common/common_main/include",
+    "-I$(TOP)/vendor-modules/connectivity/common/common_main/linux/include",
+    "-I$(TOP)/vendor-modules/connectivity/common/debug_utility",
 ]
 
 header_deps_connv1 = []
 
 ko_deps_connv1 = [
-    "//vendor/mediatek/kernel_modules/connectivity/wlan/adaptor/build/connac1x:wmt_chrdev_wifi",
-    "//vendor/mediatek/kernel_modules/connectivity/common:wmt_drv",
+    "//vendor-modules/connectivity/wlan/adaptor/build/connac1x:wmt_chrdev_wifi",
+    "//vendor-modules/connectivity/common:wmt_drv",
     "//kernel_device_modules-{}/drivers/memory/mediatek:emi-mpu".format(kernel_version),
 ]
 srcs_connv1 = [
@@ -48,25 +48,25 @@ include_connv1 = [
 # Name: CONNAC2 base
 # Description:
 copts_connv2 = [
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/connfem/include/",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/base/include",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/include",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/include",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/coredump",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/coredump/platform/include",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/metlog",
+    "-I$(TOP)/vendor-modules/connectivity/connfem/include/",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/base/include",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/include",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility/include",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility/coredump",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility/coredump/platform/include",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility/metlog",
     "-I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/connectivity/power_throttling",
 ]
 
 header_deps_connv2 = []
 
 ko_deps_connv2 = [
-    "//vendor/mediatek/kernel_modules/connectivity/wlan/adaptor/build/connac2x:wmt_chrdev_wifi_connac2",
-    "//vendor/mediatek/kernel_modules/connectivity/connfem:connfem",
-    "//vendor/mediatek/kernel_modules/connectivity/conninfra:conninfra",
-    "//vendor/mediatek/kernel_modules/connectivity/wlan/adaptor/wlan_page_pool:wlan_page_pool",
+    "//vendor-modules/connectivity/wlan/adaptor/build/connac2x:wmt_chrdev_wifi_connac2",
+    "//vendor-modules/connectivity/connfem:connfem",
+    "//vendor-modules/connectivity/conninfra:conninfra",
+    "//vendor-modules/connectivity/wlan/adaptor/wlan_page_pool:wlan_page_pool",
 ]
 
 srcs_connv2 = [
@@ -99,14 +99,14 @@ include_connv2 = [
 # Name: CONNAC3 base
 # Description:
 copts_connv3 = [
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv3/debug_utility",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv3/debug_utility/connsyslog",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv3/debug_utility/include",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv3/debug_utility",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv3/debug_utility/connsyslog",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv3/debug_utility/include",
     "-I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/connectivity/power_throttling",
     "-I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/mbraink",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/connfem/include/",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/base/include",
-    "-I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/include",
+    "-I$(TOP)/vendor-modules/connectivity/connfem/include/",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/base/include",
+    "-I$(TOP)/vendor-modules/connectivity/conninfra/include",
     "-I$(srctree)/drivers/pci/controller/",
     "-I$(srctree)/drivers/thermal",
 ]
@@ -116,12 +116,12 @@ header_deps_connv3 = [
 ]
 
 ko_deps_connv3 = [
-    "//vendor/mediatek/kernel_modules/connectivity/wlan/adaptor/build/connac3x:wmt_chrdev_wifi_connac3",
+    "//vendor-modules/connectivity/wlan/adaptor/build/connac3x:wmt_chrdev_wifi_connac3",
     "//kernel_device_modules-{}/drivers/pci/controller:pcie-mediatek-gen3".format(kernel_version),
     "//kernel_device_modules-{}/drivers/soc/mediatek/devapc:device-apc-common-legacy".format(kernel_version),
-    "//vendor/mediatek/kernel_modules/connectivity/connfem:connfem",
-    "//vendor/mediatek/kernel_modules/connectivity/conninfra:conninfra",
-    "//vendor/mediatek/kernel_modules/connectivity/wlan/adaptor/wlan_page_pool:wlan_page_pool",
+    "//vendor-modules/connectivity/connfem:connfem",
+    "//vendor-modules/connectivity/conninfra:conninfra",
+    "//vendor-modules/connectivity/wlan/adaptor/wlan_page_pool:wlan_page_pool",
     "//kernel_device_modules-{}/drivers/misc/mediatek/sched:mtk_core_ctl".format(kernel_version),
 ]
 

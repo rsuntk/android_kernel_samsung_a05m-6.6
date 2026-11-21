@@ -4,8 +4,10 @@ ifeq ($(DEVICE_MODULES_PATH),)
 DEVICE_MODULES_PATH = $(srctree)
 else
 LINUXINCLUDE := $(DEVCIE_MODULES_INCLUDE) $(LINUXINCLUDE)
-TOP := $(srctree)/..
+#TOP := $(srctree)/..
 endif
+
+MODULE_NAME := wmt_chrdev_wifi
 
 # Necessary Check
 
@@ -17,7 +19,7 @@ ifneq ($(KERNEL_OUT),)
 endif
 
 ifndef TOP
-    TOP := $(srctree)/..
+    TOP := $(srctree)
 endif
 
 # Force build fail on modpost warning
@@ -29,18 +31,18 @@ ifeq ($(CONNAC_VER), 3_0)
     ccflags-y += -DCFG_SUPPORT_CONNAC3X=1
     CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH := n
 else ifeq ($(CONNAC_VER), 2_0)
-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/include
-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility
-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/include
-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog
-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/conninfra/conn_drv/connv2/debug_utility/coredump
+    ccflags-y += -I$(TOP)/vendor-modules/connectivity/conninfra/include
+    ccflags-y += -I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility
+    ccflags-y += -I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility/include
+    ccflags-y += -I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility/connsyslog
+    ccflags-y += -I$(TOP)/vendor-modules/connectivity/conninfra/conn_drv/connv2/debug_utility/coredump
     ccflags-y += -DCFG_ANDORID_CONNINFRA_SUPPORT=1
     ccflags-y += -DCFG_ANDORID_CONNINFRA_COREDUMP_SUPPORT=1
     ccflags-y += -DCFG_SUPPORT_CONNAC2X=1
 else
     ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/mt-plat
-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/common_main/include
-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/common_main/linux/include
+    ccflags-y += -I$(TOP)/vendor-modules/connectivity/common/common_main/include
+    ccflags-y += -I$(TOP)/vendor-modules/connectivity/common/common_main/linux/include
     ccflags-y += -DCFG_ANDORID_CONNINFRA_SUPPORT=0
     ccflags-y += -DCFG_ANDORID_CONNINFRA_COREDUMP_SUPPORT=0
     ccflags-y += -DCFG_SUPPORT_CONNAC1X=1
@@ -48,7 +50,7 @@ endif
 
 ifeq ($(CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH), y)
     ccflags-y += -DCFG_MTK_CONNSYS_DEDICATED_LOG_PATH
-    ccflags-y += -I$(TOP)/vendor/mediatek/kernel_modules/connectivity/common/debug_utility
+    ccflags-y += -I$(TOP)/vendor-modules/connectivity/common/debug_utility
 endif
 
 ifeq ($(CONFIG_MTK_CONN_LTE_IDC_SUPPORT),y)
