@@ -502,7 +502,7 @@
 
 #define write_etm4x_sysreg_offset(val, offset, _64bit)			\
 	do {								\
-		if (__builtin_constant_p((offset)))			\
+		if (__is_constexpr((offset)))				\
 			write_etm4x_sysreg_const_offset((val),		\
 							(offset));	\
 		else							\
