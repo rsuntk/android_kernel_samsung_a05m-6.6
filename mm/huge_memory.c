@@ -635,7 +635,7 @@ static struct thpsize *thpsize_create(int order, struct kobject *parent)
 	ret = kobject_init_and_add(&thpsize->kobj, &thpsize_ktype, parent,
 				   "hugepages-%lukB", size);
 	if (ret) {
-		kfree(thpsize);
+		kobject_put(&thpsize->kobj);
 		return ERR_PTR(ret);
 	}
 
@@ -2079,14 +2079,12 @@ int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		spin_unlock(ptl);
 	} else {
 		struct folio *folio = NULL;
+		struct page *page = NULL;
 		int flush_needed = 1;
 
 		if (pmd_present(orig_pmd)) {
-			struct page *page = pmd_page(orig_pmd);
-
+			page = pmd_page(orig_pmd);
 			folio = page_folio(page);
-			folio_remove_rmap_pmd(folio, page, vma);
-			VM_BUG_ON_PAGE(page_mapcount(page) < 0, page);
 			VM_BUG_ON_PAGE(!PageHead(page), page);
 		} else if (thp_migration_supported()) {
 			swp_entry_t entry;
@@ -2109,6 +2107,12 @@ int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 
 			if (pmd_present(orig_pmd) && pmd_dirty(orig_pmd))
 				folio_mark_dirty(folio);
+		}
+
+		/* Remove the rmap after transferring the dirty bit to the folio. */
+		if (pmd_present(orig_pmd)) {
+			folio_remove_rmap_pmd(folio, page, vma);
+			VM_BUG_ON_PAGE(page_mapcount(page) < 0, page);
 		}
 
 		spin_unlock(ptl);
@@ -2380,7 +2384,7 @@ int move_pages_huge_pmd(struct mm_struct *mm, pmd_t *dst_pmd, pmd_t *src_pmd, pm
 	if (!pmd_trans_huge(src_pmdval)) {
 		spin_unlock(src_ptl);
 		if (is_pmd_migration_entry(src_pmdval)) {
-			pmd_migration_entry_wait(mm, &src_pmdval);
+			pmd_migration_entry_wait(mm, src_pmd);
 			return -EAGAIN;
 		}
 		return -ENOENT;
